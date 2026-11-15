@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Детектор канарейки 🐤</title>
+<title>Детектор канарейки 🐤 v2</title>
 <style>
   body {
     margin: 0; font-family: system-ui, sans-serif;
@@ -15,22 +15,28 @@
   #video { width: 100%; display: block; border-radius: 8px; background: #000; }
   #overlay {
     position: absolute; inset: 0; width: 100%; height: 100%;
-    touch-action: manipulation; cursor: crosshair;
+    touch-action: none; cursor: crosshair;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
   }
   #status {
-    font-size: 1.1em; margin: 8px; padding: 10px 16px;
+    font-size: 1.05em; margin: 8px; padding: 10px 16px;
     border-radius: 12px; background: #222; text-align: center;
   }
   #status.found { background: #1b5e20; }
-  #debug { color: #888; font-size: 0.75em; margin: 4px; text-align: center; }
+  #status.alarm { background: #7f1d1d; }
+  #debug { color: #888; font-size: 0.72em; margin: 4px; text-align: center; line-height: 1.4; }
   #panel { display: flex; gap: 8px; margin: 6px; flex-wrap: wrap; justify-content: center; }
   button {
-    font-size: 0.95em; padding: 10px 14px; border: none;
+    font-size: 0.92em; padding: 10px 14px; border: none;
     border-radius: 20px; background: #ffd54f; color: #222;
   }
   button.off { background: #444; color: #aaa; }
+  #sensWrap {
+    display: flex; align-items: center; gap: 10px; margin: 6px 10px;
+    font-size: 0.9em; color: #ccc; width: 100%; max-width: 480px;
+  }
+  #sensWrap input { flex: 1; accent-color: #ffd54f; }
 
-  /* Общая обёртка модальных окон */
   .modal {
     display: none; position: fixed; inset: 0; z-index: 20;
     background: rgba(0,0,0,.93);
@@ -43,7 +49,6 @@
   #trainBtns .ok { background: #4caf50; color: #fff; }
   #trainBtns .no { background: #f44336; color: #fff; }
 
-  /* Библиотека */
   #libModal h3 { margin: 12px 0 6px; }
   .grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
   .cell { text-align: center; }
@@ -58,6 +63,7 @@
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: #333; color: #fff; padding: 10px 18px; border-radius: 20px;
     opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 40;
+    max-width: 90vw; text-align: center;
   }
   #toast.show { opacity: 1; }
 </style>
@@ -70,6 +76,11 @@
 </div>
 <div id="status">Нажмите «Запустить камеру»</div>
 <div id="debug"></div>
+<div id="sensWrap">
+  <span>Чувствительность</span>
+  <input type="range" id="sens" min="0" max="100" value="50" step="1">
+  <span id="sensVal">50</span>
+</div>
 <div id="panel">
   <button id="btn">▶ Запустить камеру</button>
   <button id="flip">📷 Сменить камеру</button>
@@ -79,7 +90,6 @@
   <button id="forget">🗑 Забыть обучение</button>
 </div>
 
-<!-- Окно обучения по фото -->
 <div id="trainModal" class="modal">
   <div id="trainHint">Обведите канарейку рамкой, затем нажмите кнопку.<br>Можно загрузить сразу несколько фото — они пойдут по очереди.</div>
   <canvas id="trainCanvas"></canvas>
@@ -90,13 +100,12 @@
   </div>
 </div>
 
-<!-- Окно библиотеки -->
 <div id="libModal" class="modal">
   <h3>📚 Снимки при срабатываниях</h3>
   <div class="grid" id="snapGrid"></div>
-  <h3>✓ Примеры «канарейка»</h3>
+  <h3>✓ Примеры «канарейка» (тап по рамке)</h3>
   <div class="grid" id="posGrid"></div>
-  <h3>✗ Примеры «не канарейка»</h3>
+  <h3>✗ Примеры «не канарейка» (удержание на рамке / тап по фону)</h3>
   <div class="grid" id="negGrid"></div>
   <button id="libClose" style="margin:16px">Закрыть</button>
 </div>
@@ -105,6 +114,9 @@
 <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
 
 <script>
+// ============================================================
+// Элементы DOM
+// ============================================================
 const video    = document.getElementById('video');
 const overlay  = document.getElementById('overlay');
 const octx     = overlay.getContext('2d');
@@ -117,31 +129,113 @@ const libBtn   = document.getElementById('libBtn');
 const photoBtn = document.getElementById('photo');
 const forgetBtn= document.getElementById('forget');
 const toastEl  = document.getElementById('toast');
+const sensEl   = document.getElementById('sens');
+const sensValEl= document.getElementById('sensVal');
 
-const W = 160, H = 120;
-const INTERVAL_MS  = 1200;
-const EMA_ALPHA    = 0.45;
-const TRIGGER_EMA  = 0.25;   // опустил с 0.33 — детектор срабатывает охотнее
-const RAW_HITS     = 2;
+// ============================================================
+// Константы
+// ============================================================
+const W = 240, H = 180, N = W * H;
+const INTERVAL_MS  = 800;
+const EMA_ALPHA    = 0.55;
+const BG_ALPHA     = 0.045;
+const MOTION_ALPHA = 0.30;
+const MOTION_THR   = 40;         // RGB-дистанция (не квадрат)
 const COOLDOWN_MS  = 8000;
-const TAP_RADIUS   = 7;
-const MAX_SAMPLES  = 30;
-const MAX_SNAPS    = 24;     // сколько снимков храним
+const TAP_RADIUS   = 10;
+const MAX_SAMPLES  = 25;
+const MAX_SNAPS    = 20;
+const HOLD_MS      = 600;
+const RAW_VOTES    = 5;
+const RAW_HITS_MIN = 2;
 
+let TRIGGER_EMA = 0.30;
+
+// ============================================================
+// Состояние
+// ============================================================
 let running = false, started = false;
 let facing = 'environment', soundOn = false;
 let alarmActive = false, lastAlarm = 0;
 let prevCx = -1, prevCy = -1;
 let emaScore = 0;
 const rawVotes = [];
+let framesProcessed = 0;
+let warmupFrames = 0;
 
-// ---------- Хранилища: обучение и снимки (localStorage — не сбрасывается) ----------
-const LEARN_KEY = 'canary_learn_v3';
-const PREFS_KEY = 'canary_prefs_v3';
-const SNAPS_KEY = 'canary_snaps_v3';
+// ============================================================
+// Буферы (аллоцируются один раз)
+// ============================================================
+const avgR = new Float32Array(N);
+const avgG = new Float32Array(N);
+const avgB = new Float32Array(N);
+const bgR  = new Float32Array(N);
+const bgG  = new Float32Array(N);
+const bgB  = new Float32Array(N);
+const motionEMA = new Float32Array(N);
+const lumBuf    = new Float32Array(N);
+const gradBuf   = new Float32Array(N);
+let buffersReady = false;
 
-let learn = { pos: [], neg: [] }; // каждый элемент: {hist: [...], thumb: dataURL}
-let snaps = [];                    // каждый элемент: {img: dataURL, t: число}
+// Рабочие canvas'ы
+const workCanvas = document.createElement('canvas');
+workCanvas.width = W; workCanvas.height = H;
+const ctx = workCanvas.getContext('2d', { willReadFrequently: true });
+
+const snapCanvas = document.createElement('canvas');
+const snapCtx = snapCanvas.getContext('2d');
+
+// ============================================================
+// LUT для попиксельного обучения (4-бит RGB = 4096 ячеек)
+// ============================================================
+const LUT_SIZE = 4096;
+const posLUT = new Uint8Array(LUT_SIZE);
+const negLUT = new Uint8Array(LUT_SIZE);
+
+function lutIndex(r, g, b) {
+  return ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+}
+function markLUT(lut, r, g, b) {
+  const ri = r >> 4, gi = g >> 4, bi = b >> 4;
+  for (let dr = -1; dr <= 1; dr++)
+    for (let dg = -1; dg <= 1; dg++)
+      for (let db = -1; db <= 1; db++) {
+        const rr = ri + dr, gg = gi + dg, bb = bi + db;
+        if (rr >= 0 && rr < 16 && gg >= 0 && gg < 16 && bb >= 0 && bb < 16)
+          lut[(rr << 8) | (gg << 4) | bb] = 1;
+      }
+}
+function rebuildLUTs() {
+  posLUT.fill(0);
+  negLUT.fill(0);
+  for (const s of learn.pos) if (s.pal) for (const c of s.pal) markLUT(posLUT, c[0], c[1], c[2]);
+  for (const s of learn.neg) if (s.pal) for (const c of s.pal) markLUT(negLUT, c[0], c[1], c[2]);
+}
+function extractPalette(pixels, n) {
+  n = n || 6;
+  const counts = new Uint16Array(LUT_SIZE);
+  for (const px of pixels) {
+    counts[lutIndex(px[0] | 0, px[1] | 0, px[2] | 0)]++;
+  }
+  const order = [];
+  for (let i = 0; i < LUT_SIZE; i++) if (counts[i]) order.push([i, counts[i]]);
+  order.sort((a, b) => b[1] - a[1]);
+  return order.slice(0, n).map(([i]) => [
+    (((i >> 8) & 15) << 4) + 8,
+    (((i >> 4) & 15) << 4) + 8,
+    ((i & 15) << 4) + 8
+  ]);
+}
+
+// ============================================================
+// Хранилища
+// ============================================================
+const LEARN_KEY = 'canary_learn_v4';
+const PREFS_KEY = 'canary_prefs_v4';
+const SNAPS_KEY = 'canary_snaps_v4';
+
+let learn = { pos: [], neg: [] };
+let snaps = [];
 
 try {
   const saved = JSON.parse(localStorage.getItem(LEARN_KEY));
@@ -152,25 +246,47 @@ try { snaps = JSON.parse(localStorage.getItem(SNAPS_KEY)) || []; } catch (e) {}
 function saveLearn() { try { localStorage.setItem(LEARN_KEY, JSON.stringify(learn)); } catch (e) {} }
 function saveSnaps() { try { localStorage.setItem(SNAPS_KEY, JSON.stringify(snaps)); } catch (e) {} }
 
+let sensitivity = 50;
 try {
   const prefs = JSON.parse(localStorage.getItem(PREFS_KEY)) || {};
   if (typeof prefs.soundOn === 'boolean') soundOn = prefs.soundOn;
   if (prefs.facing) facing = prefs.facing;
+  if (typeof prefs.sensitivity === 'number') sensitivity = prefs.sensitivity;
 } catch (e) {}
+
 function savePrefs() {
-  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ soundOn, facing })); } catch (e) {}
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ soundOn, facing, sensitivity })); } catch (e) {}
 }
+
+function applySensitivity() {
+  sensValEl.textContent = sensitivity;
+  sensEl.value = sensitivity;
+  TRIGGER_EMA = 0.45 - (sensitivity / 100) * 0.35; // 0.45 .. 0.10
+}
+applySensitivity();
+
+sensEl.addEventListener('input', () => {
+  sensitivity = +sensEl.value;
+  applySensitivity();
+  savePrefs();
+});
+
 soundBtn.textContent = soundOn ? '🔊 Звук: вкл' : '🔇 Звук: выкл';
 soundBtn.classList.toggle('off', !soundOn);
 flipBtn.textContent = facing === 'user' ? '🤳 Фронталка' : '📷 Сменить камеру';
 
+rebuildLUTs();
+
 function showToast(text) {
   toastEl.textContent = text;
   toastEl.classList.add('show');
-  setTimeout(() => toastEl.classList.remove('show'), 1800);
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toastEl.classList.remove('show'), 1800);
 }
 
-// ---------- Пищалка ----------
+// ============================================================
+// Пищалка
+// ============================================================
 let audioCtx = null;
 function unlockAudio() {
   try {
@@ -218,11 +334,15 @@ soundBtn.addEventListener('click', () => {
 
 forgetBtn.addEventListener('click', () => {
   learn = { pos: [], neg: [] };
+  posLUT.fill(0);
+  negLUT.fill(0);
   saveLearn();
   showToast('Обучение сброшено (снимки остались)');
 });
 
-// ---------- Камера: устойчивый запуск ----------
+// ============================================================
+// Камера
+// ============================================================
 async function start() {
   if (started) return;
   btn.disabled = true; btn.textContent = '▶ Запускаю…';
@@ -232,7 +352,8 @@ async function start() {
     started = true;
     btn.textContent = '▶ Работает';
     running = true;
-    statusEl.textContent = 'Ищу канарейку… тап по рамке = «канарейка», тап мимо = «не канарейка»';
+    warmupFrames = 4;
+    statusEl.textContent = 'Тап по рамке = «канарейка», удержание на рамке = «не канарейка»';
     setInterval(analyze, INTERVAL_MS);
   } catch (e) {
     btn.disabled = false; btn.textContent = '▶ Запустить камеру';
@@ -252,11 +373,10 @@ async function openStream() {
     audio: false
   });
   video.srcObject = stream;
-  // Ждём, пока видео реально начнёт отдавать кадры
   if (video.readyState < 2) {
     await new Promise(res => video.addEventListener('loadeddata', res, { once: true }));
   }
-  try { await video.play(); } catch (e) { /* некоторые браузеры сами запускают */ }
+  try { await video.play(); } catch (e) {}
   const track = stream.getVideoTracks()[0];
   if (track && 'contentHint' in track) track.contentHint = 'motion';
 }
@@ -270,7 +390,8 @@ async function flipCamera() {
   facing = facing === 'environment' ? 'user' : 'environment';
   flipBtn.textContent = facing === 'user' ? '🤳 Фронталка' : '📷 Сменить камеру';
   savePrefs();
-  avgReady = false;
+  buffersReady = false;
+  warmupFrames = 4;
   if (video.srcObject) {
     video.srcObject.getTracks().forEach(t => t.stop());
     try { await openStream(); } catch (e) { statusEl.textContent = 'Не удалось переключить камеру'; }
@@ -278,22 +399,12 @@ async function flipCamera() {
 }
 flipBtn.addEventListener('click', flipCamera);
 
-// ---------- Рабочая сетка и скользящее усреднение ----------
-const avgR = new Float32Array(W * H);
-const avgG = new Float32Array(W * H);
-const avgB = new Float32Array(W * H);
-let avgReady = false;
-
-const workCanvas = document.createElement('canvas');
-workCanvas.width = W; workCanvas.height = H;
-const ctx = workCanvas.getContext('2d', { willReadFrequently: true });
-
-// Канва для снимков и превью
-const snapCanvas = document.createElement('canvas');
-const snapCtx = snapCanvas.getContext('2d');
-
-// ---------- Цветовые гистограммы ----------
+// ============================================================
+// Гистограммы (те же 12×3×3 = 108 бин, что в v3)
+// ============================================================
 const HBINS = 12, SBINS = 3, VBINS = 3;
+const HBIN_SIZE = HBINS * SBINS * VBINS;
+
 function hsvOf(r, g, b) {
   const max = Math.max(r, g, b), min = Math.min(r, g, b);
   const v = max / 255;
@@ -308,10 +419,10 @@ function hsvOf(r, g, b) {
   return [h, s, v];
 }
 function buildHist(collect) {
-  const hist = new Float32Array(HBINS * SBINS * VBINS);
+  const hist = new Float32Array(HBIN_SIZE);
   let n = 0;
-  for (const [r, g, b] of collect) {
-    const [h, s, v] = hsvOf(r, g, b);
+  for (const px of collect) {
+    const [h, s, v] = hsvOf(px[0], px[1], px[2]);
     if (s <= 0.12 || v <= 0.12) continue;
     const hi = Math.min(HBINS - 1, h / 30 | 0);
     const si = Math.min(SBINS - 1, s * SBINS | 0);
@@ -349,10 +460,12 @@ function learnedScore(hist) {
   let posBest = 0, negBest = 0;
   for (const e of learn.pos) posBest = Math.max(posBest, sim(hist, e.hist));
   for (const e of learn.neg) negBest = Math.max(negBest, sim(hist, e.hist));
-  return Math.max(0, Math.min(1, 0.5 + (posBest - negBest) * 1.5));
+  return Math.max(0, Math.min(1, 0.5 + (posBest - negBest) * 1.2));
 }
 
-// Превью для примера обучения: рисуем область сетки укрупнённо
+// ============================================================
+// Миниатюры и палитра
+// ============================================================
 function thumbFromCells(x0, y0, x1, y1, mask, size) {
   size = size || 64;
   snapCanvas.width = size; snapCanvas.height = size;
@@ -369,54 +482,101 @@ function thumbFromCells(x0, y0, x1, y1, mask, size) {
   return snapCanvas.toDataURL('image/jpeg', 0.6);
 }
 
-function addLearn(isPos, hist, thumb) {
-  const arr = isPos ? learn.pos : learn.neg;
-  arr.push({ hist: Array.from(hist), thumb });
-  if (arr.length > MAX_SAMPLES) arr.shift();
-  saveLearn();
+function paletteFromRegion(x0, y0, x1, y1, mask) {
+  const px = [];
+  for (let y = y0; y <= y1; y += 2) {
+    for (let x = x0; x <= x1; x += 2) {
+      const p = y * W + x;
+      if (mask && !mask[p]) continue;
+      px.push([avgR[p] | 0, avgG[p] | 0, avgB[p] | 0]);
+    }
+  }
+  return extractPalette(px, 6);
 }
 
-// ---------- Тапы по живому видео: рамка = канарейка ----------
+function addLearn(isPos, hist, thumb, pal) {
+  const arr = isPos ? learn.pos : learn.neg;
+  arr.push({ hist: Array.from(hist), thumb, pal: pal || null });
+  if (arr.length > MAX_SAMPLES) arr.shift();
+  saveLearn();
+  rebuildLUTs();
+}
+
+// ============================================================
+// Тап / удержание
+// ============================================================
 let flashUntil = 0, flashBox = null, flashColor = '#4f4', flashPoint = null;
 function flashRect(b, color) { flashBox = b; flashColor = color; flashPoint = null; flashUntil = Date.now() + 1200; }
 function flashTap(gx, gy, color) { flashPoint = [gx, gy]; flashColor = color; flashBox = null; flashUntil = Date.now() + 1200; }
 
+let press = null;
+let holdRaf = null;
+
+overlay.addEventListener('contextmenu', e => e.preventDefault());
+
 overlay.addEventListener('pointerdown', (e) => {
-  if (!running || !avgReady) return;
+  if (!running || !buffersReady) return;
   const rect = overlay.getBoundingClientRect();
   const gx = Math.floor((e.clientX - rect.left) / rect.width  * W);
   const gy = Math.floor((e.clientY - rect.top)  / rect.height * H);
   if (gx < 0 || gy < 0 || gx >= W || gy >= H) return;
-
   const hit = lastBlobs.find(b => gx >= b.minX && gx <= b.maxX && gy >= b.minY && gy <= b.maxY);
+  press = { gx, gy, hit, t0: Date.now(), longDone: false };
+  overlay.setPointerCapture(e.pointerId);
+  const tick = () => {
+    if (!press) { holdRaf = null; return; }
+    drawOverlay();
+    holdRaf = requestAnimationFrame(tick);
+  };
+  holdRaf = requestAnimationFrame(tick);
+});
+
+function endPress() {
+  if (!press) return;
+  const { gx, gy, hit, t0, longDone } = press;
+  press = null;
+  const held = longDone || (Date.now() - t0 >= HOLD_MS);
+
   if (hit) {
     const hist = histFromBlob(hit, lastMask);
-    if (hist) {
-      const thumb = thumbFromCells(hit.minX, hit.minY, hit.maxX, hit.maxY, lastMask);
-      addLearn(true, hist, thumb);
+    if (!hist) { showToast('Слишком темно, нечего запоминать'); return; }
+    const pal = paletteFromRegion(hit.minX, hit.minY, hit.maxX, hit.maxY, lastMask);
+    const thumb = thumbFromCells(hit.minX, hit.minY, hit.maxX, hit.maxY, lastMask);
+    if (held) {
+      addLearn(false, hist, thumb, pal);
+      showToast('✗ Запомнил: НЕ канарейка (' + learn.neg.length + ')');
+      flashRect(hit, '#f44');
+    } else {
+      addLearn(true, hist, thumb, pal);
       showToast('✓ Запомнил: канарейка (' + learn.pos.length + ')');
       flashRect(hit, '#4f4');
     }
   } else {
     const hist = histFromTap(gx, gy);
     if (hist) {
-      const thumb = thumbFromCells(Math.max(0, gx - TAP_RADIUS), Math.max(0, gy - TAP_RADIUS),
-                                   Math.min(W - 1, gx + TAP_RADIUS), Math.min(H - 1, gy + TAP_RADIUS), null);
-      addLearn(false, hist, thumb);
-      showToast('✗ Запомнил: НЕ канарейка (' + learn.neg.length + ')');
+      const x0 = Math.max(0, gx - TAP_RADIUS), x1 = Math.min(W - 1, gx + TAP_RADIUS);
+      const y0 = Math.max(0, gy - TAP_RADIUS), y1 = Math.min(H - 1, gy + TAP_RADIUS);
+      const pal = paletteFromRegion(x0, y0, x1, y1, null);
+      const thumb = thumbFromCells(x0, y0, x1, y1, null);
+      addLearn(false, hist, thumb, pal);
+      showToast('✗ Запомнил: фон, НЕ канарейка (' + learn.neg.length + ')');
       flashTap(gx, gy, '#f44');
     } else showToast('Слишком темно, нечего запоминать');
   }
-});
+}
 
-// ---------- Обучение по фото: несколько файлов подряд ----------
+overlay.addEventListener('pointerup', endPress);
+overlay.addEventListener('pointercancel', () => { press = null; });
+
+// ============================================================
+// Обучение по фото
+// ============================================================
 const trainModal  = document.getElementById('trainModal');
 const trainCanvas = document.getElementById('trainCanvas');
 const trainCtx    = trainCanvas.getContext('2d');
 const fileInput   = document.getElementById('fileInput');
 const trainHint   = document.getElementById('trainHint');
-let photoQueue = [];   // очередь загруженных файлов
-let trainImg = null, dragStart = null, dragNow = null;
+let photoQueue = [], trainImg = null, dragStart = null, dragNow = null;
 
 photoBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
@@ -433,8 +593,7 @@ function nextPhoto() {
   const img = new Image();
   img.onload = () => {
     trainImg = img;
-    const maxW = 640;
-    const scale = Math.min(1, maxW / img.width);
+    const scale = Math.min(1, 640 / img.width);
     trainCanvas.width  = img.width  * scale;
     trainCanvas.height = img.height * scale;
     trainCtx.drawImage(img, 0, 0, trainCanvas.width, trainCanvas.height);
@@ -480,31 +639,32 @@ function saveFromPhoto(isPos) {
   }
   const data = trainCtx.getImageData(0, 0, trainCanvas.width, trainCanvas.height).data;
   const collect = [];
-  const step = 3;
-  for (let y = rect[1] | 0; y < rect[3]; y += step)
-    for (let x = rect[0] | 0; x < rect[2]; x += step) {
+  for (let y = rect[1] | 0; y < rect[3]; y += 3)
+    for (let x = rect[0] | 0; x < rect[2]; x += 3) {
       const i = ((y | 0) * trainCanvas.width + (x | 0)) * 4;
       collect.push([data[i], data[i+1], data[i+2]]);
     }
   const hist = buildHist(collect);
   if (!hist) { showToast('Не получилось извлечь цвета'); return; }
+  const pal = extractPalette(collect, 6);
 
-  // Превью обведённой области (или всего кадра для отрицательного)
   const tw = 64, th = Math.max(1, (rect[3] - rect[1]) / (rect[2] - rect[0]) * tw) | 0;
   snapCanvas.width = tw; snapCanvas.height = th;
   snapCtx.drawImage(trainCanvas, rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1], 0, 0, tw, th);
   const thumb = snapCanvas.toDataURL('image/jpeg', 0.6);
 
-  addLearn(isPos, hist, thumb);
+  addLearn(isPos, hist, thumb, pal);
   showToast(isPos ? '✓ Канарейка запомнена (' + learn.pos.length + ')'
                   : '✗ Фон без канарейки запомнен (' + learn.neg.length + ')');
-  nextPhoto(); // следующее фото из очереди или закрытие
+  nextPhoto();
 }
 document.getElementById('trainPos').addEventListener('click', () => saveFromPhoto(true));
 document.getElementById('trainNeg').addEventListener('click', () => saveFromPhoto(false));
 document.getElementById('trainClose').addEventListener('click', () => { photoQueue = []; trainModal.classList.remove('open'); });
 
-// ---------- Снимок при срабатывании ----------
+// ============================================================
+// Снимок при срабатывании
+// ============================================================
 function captureSnapshot() {
   try {
     const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
@@ -514,10 +674,12 @@ function captureSnapshot() {
     snaps.push({ img: snapCanvas.toDataURL('image/jpeg', 0.55), t: Date.now() });
     if (snaps.length > MAX_SNAPS) snaps.shift();
     saveSnaps();
-  } catch (e) { /* снимок не критичен */ }
+  } catch (e) {}
 }
 
-// ---------- Библиотека ----------
+// ============================================================
+// Библиотека
+// ============================================================
 const libModal  = document.getElementById('libModal');
 const snapGrid  = document.getElementById('snapGrid');
 const posGrid   = document.getElementById('posGrid');
@@ -528,11 +690,7 @@ function renderCell(gridEl, thumb, caption, onDelete) {
   cell.className = 'cell';
   const img = document.createElement('img');
   img.src = thumb;
-  if (onDelete) {
-    img.addEventListener('click', onDelete);
-    img.style.cursor = 'pointer';
-    img.title = 'Нажмите, чтобы удалить';
-  }
+  if (onDelete) { img.addEventListener('click', onDelete); img.style.cursor = 'pointer'; img.title = 'Нажмите, чтобы удалить'; }
   const cap = document.createElement('div');
   cap.className = 'cap'; cap.textContent = caption;
   cell.appendChild(img); cell.appendChild(cap);
@@ -548,65 +706,72 @@ libBtn.addEventListener('click', () => {
   snapGrid.innerHTML = posGrid.innerHTML = negGrid.innerHTML = '';
   if (snaps.length)
     for (let i = snaps.length - 1; i >= 0; i--)
-      renderCell(snapGrid, snaps[i].img,
-        new Date(snaps[i].t).toLocaleTimeString('ru-RU'),
+      renderCell(snapGrid, snaps[i].img, new Date(snaps[i].t).toLocaleTimeString('ru-RU'),
         () => { snaps.splice(i, 1); saveSnaps(); libBtn.click(); showToast('Снимок удалён'); });
-  else renderEmpty(snapGrid, 'Пока пусто — снимки появляются при срабатывании пищалки');
+  else renderEmpty(snapGrid, 'Пока пусто — снимки появляются при срабатывании');
 
   if (learn.pos.length)
     learn.pos.forEach((e, i) => renderCell(posGrid, e.thumb, '№' + (i + 1),
-      () => { learn.pos.splice(i, 1); saveLearn(); libBtn.click(); showToast('Пример удалён'); }));
-  else renderEmpty(posGrid, 'Тапайте по рамке на живой камере или обводите на фото');
+      () => { learn.pos.splice(i, 1); saveLearn(); rebuildLUTs(); libBtn.click(); showToast('Пример удалён'); }));
+  else renderEmpty(posGrid, 'Коротко тапайте по рамке на живой камере');
 
   if (learn.neg.length)
     learn.neg.forEach((e, i) => renderCell(negGrid, e.thumb, '№' + (i + 1),
-      () => { learn.neg.splice(i, 1); saveLearn(); libBtn.click(); showToast('Пример удалён'); }));
-  else renderEmpty(negGrid, 'Тапайте мимо рамок — фон запомнится как «не канарейка»');
+      () => { learn.neg.splice(i, 1); saveLearn(); rebuildLUTs(); libBtn.click(); showToast('Пример удалён'); }));
+  else renderEmpty(negGrid, 'Удерживайте палец на рамке или тапайте по фону');
 
   libModal.classList.add('open');
 });
 document.getElementById('libClose').addEventListener('click', () => libModal.classList.remove('open'));
 
-// ---------- Освещение ----------
+// ============================================================
+// Освещение
+// ============================================================
 function medianLum() {
   const hist = new Uint16Array(32);
-  for (let p = 0; p < W * H; p += 8) {
+  for (let p = 0; p < N; p += 8) {
     const lum = (avgR[p] * 0.3 + avgG[p] * 0.59 + avgB[p] * 0.11) / 255;
     hist[Math.min(31, lum * 32 | 0)]++;
   }
   let acc = 0;
-  const total = W * H / 8;
+  const total = N / 8;
   for (let b = 0; b < 32; b++) { acc += hist[b]; if (acc > total / 3) return b / 32; }
   return 0.5;
 }
 
-// ---------- Форма пятна ----------
-function blobScore(b, lum) {
-  const minSize = lum < 0.35 ? 16 : 20;   // мягче прежнего
+// ============================================================
+// Оценка формы + текстура
+// ============================================================
+function shapeScore(b, lumAvg) {
+  const minSize = lumAvg < 0.35 ? 25 : 35;
   if (b.size < minSize) return 0;
-  if (b.size > W * H * 0.5) return 0;
-  if (b.fill < 0.38) return 0;            // мягче прежнего
-  if (b.ratio > 3.0) return 0;
-  const ratioFit = 1 - Math.min(1, Math.log(b.ratio) / Math.log(3.0));
-  const sizeBonus = Math.min(1, Math.sqrt(b.size / 400));
+  if (b.size > N * 0.45) return 0;
+  if (b.fill < 0.32) return 0;
+  if (b.ratio > 3.2) return 0;
+  const ratioFit = 1 - Math.min(1, Math.log(b.ratio) / Math.log(3.2));
+  const sizeBonus = Math.min(1, Math.sqrt(b.size / 500));
   return b.fill * (0.55 + 0.45 * ratioFit) * (0.55 + 0.45 * sizeBonus);
 }
 
-// ---------- Поиск связных пятен ----------
+// ============================================================
+// Связные пятна
+// ============================================================
 function findBlobs(mask) {
-  const visited = new Uint8Array(W * H);
+  const visited = new Uint8Array(N);
   const blobs = [];
   const stack = [];
-  for (let start = 0; start < mask.length; start++) {
+  for (let start = 0; start < N; start++) {
     if (!mask[start] || visited[start]) continue;
     stack.length = 0; stack.push(start);
     visited[start] = 1;
-    let size = 0, sumX = 0, sumY = 0;
+    let size = 0, sumX = 0, sumY = 0, sumMot = 0, sumGrad = 0;
     let minX = W, maxX = 0, minY = H, maxY = 0;
     while (stack.length) {
       const p = stack.pop();
       const x = p % W, y = (p / W) | 0;
       size++; sumX += x; sumY += y;
+      sumMot += motionEMA[p];
+      sumGrad += gradBuf[p];
       if (x < minX) minX = x; if (x > maxX) maxX = x;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
       if (x > 0   && mask[p-1] && !visited[p-1]) { visited[p-1] = 1; stack.push(p-1); }
@@ -615,16 +780,21 @@ function findBlobs(mask) {
       if (y < H-1 && mask[p+W] && !visited[p+W]) { visited[p+W] = 1; stack.push(p+W); }
     }
     const bw = maxX - minX + 1, bh = maxY - minY + 1;
-    blobs.push({ size, fill: size / (bw * bh),
-                 ratio: Math.max(bw, bh) / Math.min(bw, bh),
-                 cx: sumX / size, cy: sumY / size,
-                 minX, maxX, minY, maxY, score: 0 });
+    blobs.push({
+      size, fill: size / (bw * bh),
+      ratio: Math.max(bw, bh) / Math.min(bw, bh),
+      cx: sumX / size, cy: sumY / size,
+      minX, maxX, minY, maxY,
+      motionAvg: sumMot / size,
+      gradAvg: sumGrad / size,
+      score: 0, ls: null
+    });
   }
   return blobs;
 }
 function dilate(mask) {
   const copy = mask.slice();
-  for (let p = 0; p < W * H; p++) {
+  for (let p = 0; p < N; p++) {
     if (copy[p]) continue;
     const x = p % W, y = (p / W) | 0;
     if ((x > 0 && copy[p-1]) || (x < W-1 && copy[p+1]) ||
@@ -632,7 +802,9 @@ function dilate(mask) {
   }
 }
 
-// ---------- Рамки на экране ----------
+// ============================================================
+// Отрисовка оверлея
+// ============================================================
 function drawOverlay() {
   const vw = overlay.width, vh = overlay.height;
   if (!vw) return;
@@ -653,7 +825,22 @@ function drawOverlay() {
     }
   }
 
-  if (Date.now() < flashUntil) {
+  if (press) {
+    const frac = Math.min(1, (Date.now() - press.t0) / HOLD_MS);
+    const cx = (press.gx + 0.5) * sx, cy = (press.gy + 0.5) * sy;
+    const r = Math.max(30, TAP_RADIUS * sx);
+    octx.beginPath();
+    octx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + frac * 2 * Math.PI);
+    octx.lineWidth = 6;
+    octx.strokeStyle = press.hit ? '#4f4' : '#f44';
+    octx.stroke();
+    if (!press.longDone && frac >= 1) {
+      press.longDone = true;
+      if (navigator.vibrate) navigator.vibrate(40);
+    }
+  }
+
+  if (Date.now() < flashUntil && !press) {
     octx.lineWidth = 5;
     octx.strokeStyle = flashColor;
     if (flashBox) {
@@ -667,85 +854,163 @@ function drawOverlay() {
   }
 }
 
-// ---------- Главный цикл ----------
-let lastBlobs = [], lastMask = new Uint8Array(W * H), bestBlob = null;
+// ============================================================
+// Главный цикл
+// ============================================================
+let lastBlobs = [], lastMask = new Uint8Array(N), bestBlob = null;
+let lastLumAvg = 0.5;
+let lastDebug = '';
 
 function analyze() {
   if (!running || document.hidden) return;
-  if (!video.videoWidth || video.readyState < 2) return; // камера ещё не готова — ждём
+  if (!video.videoWidth || video.readyState < 2) return;
 
   ctx.drawImage(video, 0, 0, W, H);
   const data = ctx.getImageData(0, 0, W, H).data;
+  framesProcessed++;
 
-  const a = avgReady ? EMA_ALPHA : 1;
-  for (let p = 0, i = 0; p < W * H; p++, i += 4) {
-    avgR[p] += (data[i]     - avgR[p]) * a;
-    avgG[p] += (data[i + 1] - avgG[p]) * a;
-    avgB[p] += (data[i + 2] - avgB[p]) * a;
+  // --- Усреднение, фон, движение ---
+  const a = buffersReady ? EMA_ALPHA : 1;
+  const bgA = framesProcessed < 10 ? 1 : BG_ALPHA;
+  const motThr2 = MOTION_THR * MOTION_THR;
+
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2];
+    avgR[p] += (r - avgR[p]) * a;
+    avgG[p] += (g - avgG[p]) * a;
+    avgB[p] += (b - avgB[p]) * a;
+
+    const dr = r - bgR[p], dg = g - bgG[p], db = b - bgB[p];
+    const moving = (dr*dr + dg*dg + db*db) > motThr2;
+    motionEMA[p] = motionEMA[p] * (1 - MOTION_ALPHA) + (moving ? 1 : 0) * MOTION_ALPHA;
+
+    bgR[p] += (r - bgR[p]) * bgA;
+    bgG[p] += (g - bgG[p]) * bgA;
+    bgB[p] += (b - bgB[p]) * bgA;
   }
-  avgReady = true;
+  buffersReady = true;
 
+  // --- Освещение и градиенты ---
+  let lumSum = 0;
+  for (let p = 0; p < N; p++) {
+    const l = avgR[p]*0.299 + avgG[p]*0.587 + avgB[p]*0.114;
+    lumBuf[p] = l;
+    lumSum += l;
+  }
+  lastLumAvg = lumSum / N / 255;
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const p = y*W + x;
+      let gx = 0, gy = 0;
+      if (x > 0 && x < W-1) gx = Math.abs(lumBuf[p+1] - lumBuf[p-1]);
+      if (y > 0 && y < H-1) gy = Math.abs(lumBuf[p+W] - lumBuf[p-W]);
+      gradBuf[p] = gx + gy;
+    }
+  }
+
+  // --- Цветовая маска ---
   const lum = medianLum();
-  const vMin = Math.min(0.5, Math.max(0.20, lum * 0.5));
-  const sMin = lum > 0.75 ? 0.28 : 0.34;
+  const sMin = lum > 0.7 ? 0.28 : 0.32;
+  const vMin = Math.max(0.18, Math.min(0.45, lum * 0.55));
+  const useLUT = learn.pos.length > 0 || learn.neg.length > 0;
+  const mask = new Uint8Array(N);
 
-  const mask = new Uint8Array(W * H);
-  for (let p = 0; p < W * H; p++) {
-    const [h, s, v] = hsvOf(avgR[p], avgG[p], avgB[p]);
-    if (s <= sMin || v <= vMin || v >= 0.98) continue;
-    if (h >= 33 && h <= 76) mask[p] = 1;
+  for (let p = 0; p < N; p++) {
+    const r = avgR[p], g = avgG[p], b = avgB[p];
+    const [h, s, v] = hsvOf(r, g, b);
+    let yellow = false;
+    if (s > sMin && v > vMin && v < 0.98 && h >= 22 && h <= 90) yellow = true;
+    if (yellow) { mask[p] = 1; continue; }
+    if (useLUT) {
+      const idx = lutIndex(r | 0, g | 0, b | 0);
+      if (posLUT[idx] && !negLUT[idx]) mask[p] = 1;
+    }
   }
   dilate(mask);
 
   const blobs = findBlobs(mask);
-  lastBlobs = blobs; lastMask = mask;
+  lastBlobs = blobs;
+  lastMask = mask;
 
+  // --- Скоринг ---
   let best = null, bestScore = 0;
   for (const b of blobs) {
-    let score = blobScore(b, lum);
-    if (score > 0) {
+    let score = shapeScore(b, lum);
+    if (score <= 0) { b.score = 0; continue; }
+
+    // Движение: статичный жёлтый объект давится сильно
+    score *= 0.15 + 0.85 * Math.min(1, b.motionAvg * 4);
+
+    // Текстура: мягкий множитель 0.75..1.0
+    score *= 0.75 + 0.25 * Math.min(1, b.gradAvg / 25);
+
+    // Обучение
+    if (learn.pos.length || learn.neg.length) {
       const hist = histFromBlob(b, mask);
-      const ls = learnedScore(hist);
-      if (ls !== null) {
+      if (hist) {
+        const ls = learnedScore(hist);
+        b.ls = ls;
         if (ls < 0.15 && learn.neg.length > 0) score = 0;
-        else score *= (0.3 + 1.4 * ls);
+        else score *= Math.min(1.5, 0.3 + 1.4 * ls);
       }
     }
+
     b.score = score;
     if (score > bestScore) { bestScore = score; best = b; }
   }
   bestBlob = best;
 
+  // --- Временное сглаживание ---
   emaScore = emaScore * (1 - EMA_ALPHA) + bestScore * EMA_ALPHA;
 
   rawVotes.push(!!best);
-  if (rawVotes.length > 5) rawVotes.shift();
+  if (rawVotes.length > RAW_VOTES) rawVotes.shift();
   const rawHits = rawVotes.filter(Boolean).length;
 
   if (best && prevCx >= 0 && Math.hypot(best.cx - prevCx, best.cy - prevCy) > W / 2.5) {
-    emaScore = bestScore; rawVotes.length = 0;
+    emaScore = bestScore;
+    rawVotes.length = 0;
   }
   if (best) { prevCx = best.cx; prevCy = best.cy; }
 
+  // --- Тревога ---
   const now = Date.now();
-  if (emaScore >= TRIGGER_EMA && rawHits >= RAW_HITS && now - lastAlarm > COOLDOWN_MS) {
+  if (warmupFrames <= 0 &&
+      emaScore >= TRIGGER_EMA && rawHits >= RAW_HITS_MIN &&
+      now - lastAlarm > COOLDOWN_MS) {
     lastAlarm = now;
     setAlarm(true);
-    captureSnapshot(); // фото в библиотеку при каждом срабатывании
+    captureSnapshot();
   }
   if (emaScore < TRIGGER_EMA * 0.5) setAlarm(false);
 
-  if (best) { statusEl.textContent = '🐤 Канарейка обнаружена!'; statusEl.classList.add('found'); }
-  else {
-    statusEl.classList.remove('found');
+  if (warmupFrames > 0) warmupFrames--;
+
+  // --- Статус ---
+  if (best) {
+    statusEl.textContent = '🐤 Канарейка обнаружена! ' + (bestScore * 100 | 0) + '%';
+    statusEl.classList.add('found');
+    statusEl.classList.remove('alarm');
+  } else {
+    statusEl.classList.remove('found', 'alarm');
     statusEl.textContent = alarmActive ? '🐤 Канарейка (уходит из кадра)' : 'Канарейки не видно';
   }
 
-  debugEl.textContent =
-    (blobs.length
-      ? `пятен: ${blobs.length}, оценка ${best ? (bestScore * 100 | 0) : 0}, сыр ${rawHits}/5, сглаж ${emaScore.toFixed(2)}, свет ${lum.toFixed(2)}`
-      : `жёлтого нет (свет ${lum.toFixed(2)})`)
-    + ` — снимков: ${snaps.length}, обучение: ✓${learn.pos.length} ✗${learn.neg.length}`;
+  // --- Отладка ---
+  const parts = [];
+  parts.push('пятен: ' + blobs.length);
+  if (best) {
+    parts.push('оценка ' + (bestScore * 100 | 0) + '%');
+    if (best.ls !== null) parts.push('похожесть ' + best.ls.toFixed(2));
+    parts.push('движ ' + (best.motionAvg * 100 | 0) + '%');
+    parts.push('текст ' + best.gradAvg.toFixed(0));
+  }
+  parts.push('сглаж ' + emaScore.toFixed(2));
+  parts.push('свет ' + lum.toFixed(2));
+  parts.push('порог ' + TRIGGER_EMA.toFixed(2));
+  parts.push('✓' + learn.pos.length + ' ✗' + learn.neg.length);
+  debugEl.textContent = parts.join(', ');
 
   drawOverlay();
 }
