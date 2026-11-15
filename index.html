@@ -11,46 +11,68 @@
     display: flex; flex-direction: column; align-items: center;
     min-height: 100vh; padding: 8px;
   }
-  #video { width: 100%; max-width: 480px; border-radius: 8px; background: #000; }
+  .camwrap { position: relative; width: 100%; max-width: 480px; }
+  #video { width: 100%; display: block; border-radius: 8px; background: #000; }
+  #overlay {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    border-radius: 8px; touch-action: manipulation; cursor: crosshair;
+  }
   #status {
     font-size: 1.2em; margin: 10px; padding: 10px 18px;
     border-radius: 12px; background: #222; text-align: center;
   }
   #status.found { background: #1b5e20; }
-  #debug { color: #888; font-size: 0.8em; margin: 6px; text-align: center; }
-  #panel { display: flex; gap: 10px; margin: 6px; flex-wrap: wrap; justify-content: center; }
+  #debug { color: #888; font-size: 0.78em; margin: 6px; text-align: center; }
+  #panel { display: flex; gap: 8px; margin: 6px; flex-wrap: wrap; justify-content: center; }
   button {
-    font-size: 1em; padding: 10px 18px; border: none;
+    font-size: 0.95em; padding: 10px 16px; border: none;
     border-radius: 20px; background: #ffd54f; color: #222;
   }
   button.off { background: #444; color: #aaa; }
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #333; color: #fff; padding: 10px 18px; border-radius: 20px;
+    opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 10;
+  }
+  #toast.show { opacity: 1; }
 </style>
 </head>
 <body>
 
-<video id="video" playsinline muted autoplay></video>
+<div class="camwrap">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
 <div id="status">Ожидание запуска…</div>
 <div id="debug"></div>
 <div id="panel">
   <button id="btn">▶ Запустить камеру</button>
   <button id="flip">📷 Сменить камеру</button>
   <button id="sound" class="off">🔇 Звук: выкл</button>
+  <button id="forget">🗑 Забыть обучение</button>
 </div>
+<div id="toast"></div>
 
 <script>
 const video    = document.getElementById('video');
+const overlay  = document.getElementById('overlay');
+const octx     = overlay.getContext('2d');
 const statusEl = document.getElementById('status');
 const debugEl  = document.getElementById('debug');
 const btn      = document.getElementById('btn');
 const flipBtn  = document.getElementById('flip');
 const soundBtn = document.getElementById('sound');
+const forgetBtn= document.getElementById('forget');
+const toastEl  = document.getElementById('toast');
 
 const W = 160, H = 120;
-const INTERVAL_MS   = 1200;  // чаще опрашиваем — сглаживание всё равно фильтрует шум
-const EMA_ALPHA     = 0.45;  // вклад нового кадра в скользящую оценку (меньше = стабильнее)
-const TRIGGER_EMA   = 0.33;  // порог скользящей оценки для тревоги
-const RAW_HITS      = 2;     // сколько «сырых» попаданий за 5 кадров нужно
-const COOLDOWN_MS   = 8000;
+const INTERVAL_MS  = 1200;
+const EMA_ALPHA    = 0.45;
+const TRIGGER_EMA  = 0.33;
+const RAW_HITS     = 2;
+const COOLDOWN_MS  = 8000;
+const TAP_RADIUS   = 7;      // радиус пятна в клетках сетки для «плюс»-тапа
+const MAX_SAMPLES  = 25;     // максимум запомненных примеров каждого типа
 
 let running = false, facing = 'environment', soundOn = false;
 let alarmActive = false, lastAlarm = 0;
@@ -58,26 +80,35 @@ let prevCx = -1, prevCy = -1;
 let emaScore = 0;
 const rawVotes = [];
 
-// Скользящее усреднение кадра — гасит шум матрицы и мерцание
-const avgR = new Float32Array(W * H);
-const avgG = new Float32Array(W * H);
-const avgB = new Float32Array(W * H);
-let avgReady = false;
+// ---------- Память обучения (localStorage — переживает перезагрузку) ----------
+const LEARN_KEY = 'canary_learn_v1';
+const PREFS_KEY = 'canary_prefs_v1';
+let learn = { pos: [], neg: [] };
 
-const canvas = document.createElement('canvas');
-canvas.width = W; canvas.height = H;
-const ctx = canvas.getContext('2d', { willReadFrequently: true });
+try { learn = JSON.parse(localStorage.getItem(LEARN_KEY)) || learn; } catch (e) {}
+function saveLearn() { try { localStorage.setItem(LEARN_KEY, JSON.stringify(learn)); } catch (e) {} }
 
-// ---------- Пищалка: разблокировка аудио + вибрация как запасной путь ----------
+// Восстановление настроек: звук, камера
+try {
+  const prefs = JSON.parse(localStorage.getItem(PREFS_KEY)) || {};
+  if (typeof prefs.soundOn === 'boolean') soundOn = prefs.soundOn;
+  if (prefs.facing) facing = prefs.facing;
+} catch (e) {}
+function savePrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ soundOn, facing })); } catch (e) {}
+}
+soundBtn.textContent = soundOn ? '🔊 Звук: вкл' : '🔇 Звук: выкл';
+soundBtn.classList.toggle('off', !soundOn);
+flipBtn.textContent = facing === 'user' ? '🤳 Фронталка' : '📷 Сменить камеру';
+
+// ---------- Пищалка ----------
 let audioCtx = null;
-
 function unlockAudio() {
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') audioCtx.resume();
-  } catch (e) { /* нет аудио — есть вибрация */ }
+  } catch (e) {}
 }
-// Разблокируем звук при любом касании — требования iOS/Android к «жесту пользователя»
 document.body.addEventListener('pointerdown', unlockAudio);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) unlockAudio(); });
 
@@ -96,25 +127,22 @@ function tone(freq, durMs, vol, delayMs) {
     return true;
   } catch (e) { return false; }
 }
-
-// Один «чирик»: три быстрых нарастающих ноты. Если аудио не сыграет — вибрация
 function chirp() {
   const ok = tone(1100, 110, 0.5, 0) && tone(1350, 110, 0.5, 140) && tone(1600, 200, 0.5, 280);
   if (!ok && navigator.vibrate) navigator.vibrate([120, 80, 120, 80, 200]);
 }
-
-// Пока птица в кадре — чирикаем с интервалом; когда улетела — останавливаемся
 let alarmTimer = null;
 function setAlarm(on) {
   if (on === alarmActive) return;
   alarmActive = on;
-  if (on) {
-    unlockAudio();
-    chirp();
-    alarmTimer = setInterval(chirp, 1100); // повторяем, пока канарейка не улетит
-  } else if (alarmTimer) {
-    clearInterval(alarmTimer); alarmTimer = null;
-  }
+  if (on) { unlockAudio(); chirp(); alarmTimer = setInterval(chirp, 1100); }
+  else if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; }
+}
+
+function showToast(text) {
+  toastEl.textContent = text;
+  toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), 1800);
 }
 
 // ---------- Камера ----------
@@ -122,14 +150,15 @@ async function start() {
   btn.disabled = true; btn.textContent = '▶ Работает';
   await openStream();
   running = true;
-  statusEl.textContent = 'Ищу канарейку…';
+  statusEl.textContent = 'Ищу канарейку… (тап по рамке — «не птица», тап мимо рамок — «птица»)';
   setInterval(analyze, INTERVAL_MS);
 }
 
 async function openStream() {
+  // До 2 м птица занимает приличную часть кадра — 640×480 даёт запас деталям
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: facing,
-             width: { ideal: 320 }, height: { ideal: 240 },
+             width: { ideal: 640 }, height: { ideal: 480 },
              frameRate: { ideal: 5, max: 15 } },
     audio: false
   });
@@ -137,135 +166,204 @@ async function openStream() {
   await video.play();
   const track = stream.getVideoTracks()[0];
   if (track && 'contentHint' in track) track.contentHint = 'motion';
+  overlay.width = video.videoWidth || 640;
+  overlay.height = video.videoHeight || 480;
 }
 
 async function flipCamera() {
   facing = facing === 'environment' ? 'user' : 'environment';
   flipBtn.textContent = facing === 'user' ? '🤳 Фронталка' : '📷 Сменить камеру';
-  avgReady = false; // после смены камеры усреднение начинаем заново
+  savePrefs();
+  avgReady = false;
   if (video.srcObject) {
     video.srcObject.getTracks().forEach(t => t.stop());
     try { await openStream(); } catch (e) { statusEl.textContent = 'Не удалось переключить камеру'; }
   }
 }
 
-// ---------- Адаптация к освещению: примерная медианная яркость кадра ----------
-function medianLum(data) {
+soundBtn.addEventListener('click', () => {
+  soundOn = !soundOn;
+  soundBtn.textContent = soundOn ? '🔊 Звук: вкл' : '🔇 Звук: выкл';
+  soundBtn.classList.toggle('off', !soundOn);
+  savePrefs();
+  if (soundOn) { unlockAudio(); chirp(); }
+});
+
+forgetBtn.addEventListener('click', () => {
+  learn = { pos: [], neg: [] };
+  saveLearn();
+  showToast('Обучение сброшено');
+  updateDebugLearn();
+});
+
+// ---------- Скользящее усреднение кадра ----------
+const avgR = new Float32Array(W * H);
+const avgG = new Float32Array(W * H);
+const avgB = new Float32Array(W * H);
+let avgReady = false;
+
+const canvas = document.createElement('canvas');
+canvas.width = W; canvas.height = H;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+// ---------- Гистограмма цвета как «отпечаток» объекта ----------
+// 12 оттенков × 3 насыщенности × 3 яркости = 108 ячеек
+const HBINS = 12, SBINS = 3, VBINS = 3;
+function hsvOf(r, g, b) {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const v = max / 255;
+  const s = max === 0 ? 0 : (max - min) / max;
+  let h = 0;
+  if (max !== min) {
+    const d = max - min;
+    if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
+    else if (max === g) h = ((b - r) / d + 2) * 60;
+    else                h = ((r - g) / d + 4) * 60;
+  }
+  return [h, s, v];
+}
+function buildHist(collect) {
+  const hist = new Float32Array(HBINS * SBINS * VBINS);
+  let n = 0;
+  for (const [r, g, b] of collect) {
+    const [h, s, v] = hsvOf(r, g, b);
+    if (s <= 0.15 || v <= 0.15) continue; // бесцветные пиксели не учим
+    const hi = Math.min(HBINS - 1, h / 30 | 0);
+    const si = Math.min(SBINS - 1, s * SBINS | 0);
+    const vi = Math.min(VBINS - 1, v * VBINS | 0);
+    hist[hi * SBINS * VBINS + si * VBINS + vi]++;
+    n++;
+  }
+  if (n === 0) return null;
+  for (let i = 0; i < hist.length; i++) hist[i] /= n;
+  return hist;
+}
+function histFromBlob(blob, mask) {
+  const collect = [];
+  for (let y = blob.minY; y <= blob.maxY; y++)
+    for (let x = blob.minX; x <= blob.maxX; x++) {
+      const p = y * W + x;
+      if (mask[p]) collect.push([avgR[p], avgG[p], avgB[p]]);
+    }
+  return buildHist(collect);
+}
+function histFromTap(gx, gy) {
+  const collect = [];
+  for (let y = Math.max(0, gy - TAP_RADIUS); y <= Math.min(H - 1, gy + TAP_RADIUS); y++)
+    for (let x = Math.max(0, gx - TAP_RADIUS); x <= Math.min(W - 1, gx + TAP_RADIUS); x++) {
+      const p = y * W + x;
+      collect.push([avgR[p], avgG[p], avgB[p]]);
+    }
+  return buildHist(collect);
+}
+function sim(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.min(a[i], b[i]);
+  return s;
+}
+// Оценка «похожести на обученные примеры»: 0 = точно не то, 1 = точное совпадение
+function learnedScore(hist) {
+  if (!hist || (learn.pos.length === 0 && learn.neg.length === 0)) return null;
+  let posBest = 0, negBest = 0;
+  for (const h of learn.pos) posBest = Math.max(posBest, sim(hist, h));
+  for (const h of learn.neg) negBest = Math.max(negBest, sim(hist, h));
+  return Math.max(0, Math.min(1, 0.5 + (posBest - negBest) * 1.5));
+}
+
+// ---------- Обучение по тапу ----------
+overlay.addEventListener('pointerdown', (e) => {
+  if (!running || !avgReady) return;
+  const rect = overlay.getBoundingClientRect();
+  const fx = (e.clientX - rect.left) / rect.width;
+  const fy = (e.clientY - rect.top) / rect.height;
+  const gx = Math.floor(fx * W), gy = Math.floor(fy * H);
+  if (gx < 0 || gy < 0 || gx >= W || gy >= H) return;
+
+  // Тап внутри рамки обнаруженного пятна → «это НЕ канарейка»
+  const hit = lastBlobs.find(b => gx >= b.minX && gx <= b.maxX && gy >= b.minY && gy <= b.maxY);
+  if (hit) {
+    const hist = histFromBlob(hit, lastMask);
+    if (hist) {
+      learn.neg.push(hist);
+      if (learn.neg.length > MAX_SAMPLES) learn.neg.shift();
+      saveLearn();
+      showToast('✗ Запомнил: это НЕ канарейка (' + learn.neg.length + ')');
+      flashRect(hit, '#f44');
+    }
+  } else {
+    // Тап мимо всех рамок → «здесь канарейка»
+    const hist = histFromTap(gx, gy);
+    if (hist) {
+      learn.pos.push(hist);
+      if (learn.pos.length > MAX_SAMPLES) learn.pos.shift();
+      saveLearn();
+      showToast('✓ Запомнил: канарейка (' + learn.pos.length + ')');
+      flashTap(gx, gy);
+    } else {
+      showToast('Слишком темно, нечего запоминать');
+    }
+  }
+  updateDebugLearn();
+});
+
+let flashUntil = 0, flashBox = null, flashColor = '#fff', flashPoint = null;
+function flashRect(b, color) { flashBox = b; flashColor = color; flashPoint = null; flashUntil = Date.now() + 1200; drawOverlay(); }
+function flashTap(gx, gy)    { flashPoint = [gx, gy]; flashColor = '#4f4'; flashBox = null; flashUntil = Date.now() + 1200; drawOverlay(); }
+
+// ---------- Рамки на экране ----------
+function drawOverlay() {
+  const vw = overlay.width, vh = overlay.height;
+  octx.clearRect(0, 0, vw, vh);
+  if (!running) return;
+  const sx = vw / W, sy = vh / H;
+
+  for (const b of lastBlobs) {
+    if (b.size < 8) continue;
+    const isBest = (b === bestBlob);
+    octx.lineWidth = isBest ? 4 : 2;
+    octx.strokeStyle = isBest ? '#4f4' : '#ff3';
+    octx.strokeRect(b.minX * sx, b.minY * sy, (b.maxX - b.minX + 1) * sx, (b.maxY - b.minY + 1) * sy);
+    if (isBest) {
+      octx.fillStyle = '#4f4';
+      octx.font = 'bold 22px system-ui';
+      octx.fillText('🐤 ' + (b.score * 100 | 0) + '%', b.minX * sx, Math.max(20, b.minY * sy - 6));
+    }
+  }
+
+  if (Date.now() < flashUntil) {
+    octx.lineWidth = 5;
+    octx.strokeStyle = flashColor;
+    if (flashBox) {
+      octx.strokeRect(flashBox.minX * sx - 3, flashBox.minY * sy - 3,
+                      (flashBox.maxX - flashBox.minX + 1) * sx + 6, (flashBox.maxY - flashBox.minY + 1) * sy + 6);
+    } else if (flashPoint) {
+      octx.beginPath();
+      octx.arc((flashPoint[0] + 0.5) * sx, (flashPoint[1] + 0.5) * sy, TAP_RADIUS * sx, 0, Math.PI * 2);
+      octx.stroke();
+    }
+  }
+}
+
+// ---------- Освещение ----------
+function medianLum() {
   const hist = new Uint16Array(32);
-  for (let i = 0; i < data.length; i += 16) {
-    const lum = (data[i] * 0.3 + data[i+1] * 0.59 + data[i+2] * 0.11) / 255;
+  for (let p = 0; p < W * H; p += 8) {
+    const lum = (avgR[p] * 0.3 + avgG[p] * 0.59 + avgB[p] * 0.11) / 255;
     hist[Math.min(31, lum * 32 | 0)]++;
   }
   let acc = 0;
-  for (let b = 0; b < 32; b++) { acc += hist[b]; if (acc > 4096 / 3) return b / 32; }
+  const total = W * H / 8;
+  for (let b = 0; b < 32; b++) { acc += hist[b]; if (acc > total / 3) return b / 32; }
   return 0.5;
 }
 
-// ---------- Анализ кадра ----------
-function analyze() {
-  if (!running || document.hidden) return;
-
-  ctx.drawImage(video, 0, 0, W, H);
-  const data = ctx.getImageData(0, 0, W, H).data;
-
-  // Шаг 1: скользящее усреднение по кадрам — чистит шум, птица «размывается» слабо
-  const a = avgReady ? EMA_ALPHA : 1;
-  for (let p = 0, i = 0; p < W * H; p++, i += 4) {
-    avgR[p] += (data[i]     - avgR[p]) * a;
-    avgG[p] += (data[i + 1] - avgG[p]) * a;
-    avgB[p] += (data[i + 2] - avgB[p]) * a;
-  }
-  avgReady = true;
-
-  // Шаг 2: пороги под текущую освещённость
-  const lum = medianLum(avgR, avgG, avgB, W * H);
-  const vMin = Math.min(0.55, Math.max(0.22, lum * 0.55)); // в темноте порог ниже
-  const sMin = lum > 0.75 ? 0.32 : 0.38;                    // при ярком свете мягче
-
-  const mask = new Uint8Array(W * H);
-  for (let p = 0; p < W * H; p++) {
-    const r = avgR[p], g = avgG[p], b = avgB[p];
-    const max = Math.max(r, g, b), min = Math.min(r, g, b);
-    const v = max / 255;
-    const s = max === 0 ? 0 : (max - min) / max;
-    if (s <= sMin || v <= vMin || v >= 0.98) continue;
-    let h = 0;
-    if (max !== min) {
-      const d = max - min;
-      if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
-      else if (max === g) h = ((b - r) / d + 2) * 60;
-      else                h = ((r - g) / d + 4) * 60;
-    }
-    // Расширенный диапазон: от бледно-жёлтого (тень) до ярко-жёлтого (солнце)
-    if (h >= 33 && h <= 76) mask[p] = 1;
-  }
-
-  // Шаг 3: смыкание разрывов — крыло/тельце сливаются в одно пятно
-  dilate(mask);
-
-  const blobs = findBlobs(mask);
-
-  let best = null, bestScore = 0;
-  for (const b of blobs) {
-    const score = blobScore(b, lum);
-    if (score > bestScore) { bestScore = score; best = b; }
-  }
-
-  // Шаг 4: сглаживание оценки по времени — главный источник стабильности
-  emaScore = emaScore * (1 - EMA_ALPHA) + bestScore * EMA_ALPHA;
-
-  rawVotes.push(!!best);
-  if (rawVotes.length > 5) rawVotes.shift();
-  const rawHits = rawVotes.filter(Boolean).length;
-
-  // Смена сцены (камеру повернули, птица вылетела) — не тащим старую историю
-  if (best && prevCx >= 0 && Math.hypot(best.cx - prevCx, best.cy - prevCy) > W / 2.5) {
-    emaScore = bestScore; rawVotes.length = 0;
-  }
-  if (best) { prevCx = best.cx; prevCy = best.cy; }
-
-  const now = Date.now();
-  const triggered = emaScore >= TRIGGER_EMA && rawHits >= RAW_HITS &&
-                    now - lastAlarm > COOLDOWN_MS;
-
-  if (triggered) {
-    lastAlarm = now;
-    setAlarm(true);
-    setTimeout(() => statusEl.classList.add('found'), 0);
-    setTimeout(() => statusEl.classList.remove('found'), 3500);
-  }
-
-  // Птица пропала на несколько проверок подряд — тревога затихает
-  if (emaScore < TRIGGER_EMA * 0.5) setAlarm(false);
-
-  debugEl.textContent = blobs.length
-    ? `пятен: ${blobs.length}; лучш: ${best.size}px, запол. ${(best.fill * 100).toFixed(0)}%, ` +
-      `проп. ${best.ratio.toFixed(2)}, сыр ${rawHits}/5, сглаж. ${emaScore.toFixed(2)}, свет ${lum.toFixed(2)}`
-    : `жёлтого нет (свет ${lum.toFixed(2)})`;
-
-  if (best) { statusEl.textContent = '🐤 Канарейка обнаружена!'; }
-  else if (!alarmActive) { statusEl.textContent = 'Канарейки не видно'; }
-}
-
-// Расширение маски на 1 пиксель: закрывает щели между частями птицы
-function dilate(mask) {
-  const copy = mask.slice();
-  for (let p = 0; p < W * H; p++) {
-    if (copy[p]) continue;
-    const x = p % W, y = (p / W) | 0;
-    if ((x > 0 && copy[p-1]) || (x < W-1 && copy[p+1]) ||
-        (y > 0 && copy[p-W]) || (y < H-1 && copy[p+W])) mask[p] = 1;
-  }
-}
-
-// ---------- Оценка «птицеподобности» — симметрична к повороту ----------
+// ---------- Форма пятна (симметрична к повороту) ----------
 function blobScore(b, lum) {
-  // Минимальный размер зависит от яркости: в тени птица меньше контраста
-  const minSize = lum < 0.35 ? 18 : 24;
+  // До 2 м канарейка даёт пятно от ~20 клеток; ближе — больше
+  const minSize = lum < 0.35 ? 18 : 22;
   if (b.size < minSize) return 0;
   if (b.size > W * H * 0.5) return 0;
   if (b.fill < 0.42) return 0;
-  // ratio >= 1 всегда, поэтому проверка симметрична: что продольная, что поперечная ориентация
   if (b.ratio > 2.8) return 0;
   const ratioFit = 1 - Math.min(1, Math.log(b.ratio) / Math.log(2.8));
   const sizeBonus = Math.min(1, Math.sqrt(b.size / 500));
@@ -277,36 +375,124 @@ function findBlobs(mask) {
   const visited = new Uint8Array(W * H);
   const blobs = [];
   const stack = [];
-
   for (let start = 0; start < mask.length; start++) {
     if (!mask[start] || visited[start]) continue;
     stack.length = 0; stack.push(start);
     visited[start] = 1;
     let size = 0, sumX = 0, sumY = 0;
     let minX = W, maxX = 0, minY = H, maxY = 0;
-
     while (stack.length) {
       const p = stack.pop();
       const x = p % W, y = (p / W) | 0;
       size++; sumX += x; sumY += y;
       if (x < minX) minX = x; if (x > maxX) maxX = x;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
-
       if (x > 0   && mask[p-1] && !visited[p-1]) { visited[p-1] = 1; stack.push(p-1); }
       if (x < W-1 && mask[p+1] && !visited[p+1]) { visited[p+1] = 1; stack.push(p+1); }
       if (y > 0   && mask[p-W] && !visited[p-W]) { visited[p-W] = 1; stack.push(p-W); }
       if (y < H-1 && mask[p+W] && !visited[p+W]) { visited[p+W] = 1; stack.push(p+W); }
     }
-
     const bw = maxX - minX + 1, bh = maxY - minY + 1;
-    blobs.push({
-      size,
-      fill: size / (bw * bh),
-      ratio: Math.max(bw, bh) / Math.min(bw, bh),
-      cx: sumX / size, cy: sumY / size
-    });
+    blobs.push({ size, fill: size / (bw * bh),
+                 ratio: Math.max(bw, bh) / Math.min(bw, bh),
+                 cx: sumX / size, cy: sumY / size,
+                 minX, maxX, minY, maxY });
   }
   return blobs;
+}
+
+function dilate(mask) {
+  const copy = mask.slice();
+  for (let p = 0; p < W * H; p++) {
+    if (copy[p]) continue;
+    const x = p % W, y = (p / W) | 0;
+    if ((x > 0 && copy[p-1]) || (x < W-1 && copy[p+1]) ||
+        (y > 0 && copy[p-W]) || (y < H-1 && copy[p+W])) mask[p] = 1;
+  }
+}
+
+// ---------- Главный цикл ----------
+let lastBlobs = [], lastMask = null, bestBlob = null;
+
+function updateDebugLearn() {
+  return `обучение: ✓${learn.pos.length} ✗${learn.neg.length}`;
+}
+
+function analyze() {
+  if (!running || document.hidden) return;
+
+  ctx.drawImage(video, 0, 0, W, H);
+  const data = ctx.getImageData(0, 0, W, H).data;
+
+  const a = avgReady ? EMA_ALPHA : 1;
+  for (let p = 0, i = 0; p < W * H; p++, i += 4) {
+    avgR[p] += (data[i]     - avgR[p]) * a;
+    avgG[p] += (data[i + 1] - avgG[p]) * a;
+    avgB[p] += (data[i + 2] - avgB[p]) * a;
+  }
+  avgReady = true;
+
+  const lum = medianLum();
+  const vMin = Math.min(0.55, Math.max(0.22, lum * 0.55));
+  const sMin = lum > 0.75 ? 0.32 : 0.38;
+
+  const mask = new Uint8Array(W * H);
+  for (let p = 0; p < W * H; p++) {
+    const [h, s, v] = hsvOf(avgR[p], avgG[p], avgB[p]);
+    if (s <= sMin || v <= vMin || v >= 0.98) continue;
+    if (h >= 33 && h <= 76) mask[p] = 1;
+  }
+  dilate(mask);
+
+  const blobs = findBlobs(mask);
+  lastBlobs = blobs; lastMask = mask;
+
+  let best = null, bestScore = 0;
+  for (const b of blobs) {
+    let score = blobScore(b, lum);
+    // Учтём обучение: совпадение с «птицей» усиливает, с «не птицей» — давит
+    if (score > 0) {
+      const hist = histFromBlob(b, mask);
+      const ls = learnedScore(hist);
+      if (ls !== null) {
+        if (ls < 0.15 && learn.neg.length > 0) score = 0;   // уверенно «не то»
+        else score *= (0.25 + 1.5 * ls);
+      }
+      b.score = score;
+    } else b.score = 0;
+    if (score > bestScore) { bestScore = score; best = b; }
+  }
+  bestBlob = best;
+
+  emaScore = emaScore * (1 - EMA_ALPHA) + bestScore * EMA_ALPHA;
+
+  rawVotes.push(!!best);
+  if (rawVotes.length > 5) rawVotes.shift();
+  const rawHits = rawVotes.filter(Boolean).length;
+
+  if (best && prevCx >= 0 && Math.hypot(best.cx - prevCx, best.cy - prevCy) > W / 2.5) {
+    emaScore = bestScore; rawVotes.length = 0;
+  }
+  if (best) { prevCx = best.cx; prevCy = best.cy; }
+
+  const now = Date.now();
+  const triggered = emaScore >= TRIGGER_EMA && rawHits >= RAW_HITS &&
+                    now - lastAlarm > COOLDOWN_MS;
+  if (triggered) { lastAlarm = now; setAlarm(true); }
+  if (emaScore < TRIGGER_EMA * 0.5) setAlarm(false);
+
+  if (best) { statusEl.textContent = '🐤 Канарейка обнаружена!'; statusEl.classList.add('found'); }
+  else { statusEl.textContent = alarmActive ? '🐤 Канарейка (уходит из кадра)' : 'Канарейки не видно';
+         if (!best) statusEl.classList.remove('found'); }
+
+  debugEl.textContent =
+    (blobs.length
+      ? `пятен: ${blobs.length}; лучш: ${best ? best.size : 0}px, оценка ${(bestScore * 100 | 0)}, ` +
+        `сыр ${rawHits}/5, сглаж ${emaScore.toFixed(2)}, свет ${lum.toFixed(2)}, `
+      : `жёлтого нет (свет ${lum.toFixed(2)}), `)
+    + updateDebugLearn();
+
+  drawOverlay();
 }
 </script>
 
