@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Детектор канарейки 🐤</title>
+<style>
+  body {
+    margin: 0; font-family: system-ui, sans-serif;
+    background: #111; color: #eee;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh;
+  }
+  #video { width: 100%; max-width: 480px; border-radius: 8px; background: #000; }
+  #status {
+    font-size: 1.3em; margin: 16px; padding: 12px 20px;
+    border-radius: 12px; background: #222; min-width: 220px; text-align: center;
+  }
+  #status.found { background: #1b5e20; }
+  button {
+    font-size: 1.1em; padding: 12px 24px; border: none;
+    border-radius: 24px; background: #ffd54f; color: #222;
+  }
+  #debug { color: #888; font-size: 0.85em; margin: 8px; }
+</style>
+</head>
+<body>
+
+<video id="video" playsinline muted autoplay></video>
+<div id="status">Ожидание запуска…</div>
+<div id="debug"></div>
+<button id="btn">▶ Запустить камеру</button>
+
+<script>
+const video    = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const debugEl  = document.getElementById('debug');
+const btn      = document.getElementById('btn');
+
+// Канва — маленькая: меньше пикселей = меньше вычислений = меньше батарейки
+const W = 96, H = 72;
+const canvas = document.createElement('canvas');
+canvas.width = W; canvas.height = H;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+const INTERVAL_MS = 2000;   // проверяем раз в 2 секунды
+let running = false;
+
+btn.addEventListener('click', start);
+
+async function start() {
+  btn.disabled = true;
+  try {
+    // Низкое разрешение — камера потребляет заметно меньше энергии
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 320 }, height: { ideal: 240 },
+               frameRate: { ideal: 5, max: 15 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    // Подсказываем системе, что поток «фоновый» — на некоторых телефонах
+    // это снижает энергопотребление и частоту кадров
+    const track = stream.getVideoTracks()[0];
+    if (track && 'contentHint' in track) track.contentHint = 'motion';
+
+    running = true;
+    statusEl.textContent = 'Ищу канарейку…';
+    setInterval(analyze, INTERVAL_MS);
+  } catch (e) {
+    statusEl.textContent = 'Нет доступа к камере: ' + e.message;
+  }
+}
+
+function analyze() {
+  if (!running) return;
+
+  // Рисуем один кадр в мини-канву
+  ctx.drawImage(video, 0, 0, W, H);
+  const data = ctx.getImageData(0, 0, W, H).data;
+
+  // Маска «жёлтого»: H в градусах 40–70, насыщенность и яркость выше порога
+  const mask = new Uint8Array(W * H);
+  let yellowCount = 0;
+
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const r = data[i], g = data[i+1], b = data[i+2];
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const v = max / 255;
+    const s = max === 0 ? 0 : (max - min) / max;
+
+    let h = 0;
+    if (max !== min) {
+      const d = max - min;
+      if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0));
+      else if (max === g) h = (b - r) / d + 2;
+      else                h = (r - g) / d + 4;
+      h *= 60;
+    }
+
+    if (h >= 40 && h <= 70 && s > 0.45 && v > 0.35) {
+      mask[p] = 1;
+      yellowCount++;
+    }
+  }
+
+  const fraction = yellowCount / (W * H);
+
+  // Считаем крупнейший связный «жёлтый» блоб простым flood fill
+  const biggest = largestBlob(mask);
+
+  // Канарейка: приличная доля жёлтого И блоб не крошечный и не весь экран
+  const found = fraction > 0.015 && biggest.size >= 12 && biggest.size < W * H * 0.5;
+
+  showResult(found, fraction, biggest);
+}
+
+function largestBlob(mask) {
+  const visited = new Uint8Array(W * H);
+  let best = { size: 0, cx: 0, cy: 0 };
+  const stack = [];
+
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || visited[start]) continue;
+    stack.length = 0;
+    stack.push(start);
+    visited[start] = 1;
+    let size = 0, sumX = 0, sumY = 0;
+
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % W, y = (p / W) | 0;
+      size++; sumX += x; sumY += y;
+
+      // 4-связность, без выхода за границы
+      if (x > 0     && mask[p-1] && !visited[p-1]) { visited[p-1] = 1; stack.push(p-1); }
+      if (x < W-1   && mask[p+1] && !visited[p+1]) { visited[p+1] = 1; stack.push(p+1); }
+      if (y > 0     && mask[p-W] && !visited[p-W]) { visited[p-W] = 1; stack.push(p-W); }
+      if (y < H-1   && mask[p+W] && !visited[p+W]) { visited[p+W] = 1; stack.push(p+W); }
+    }
+
+    if (size > best.size) best = { size, cx: sumX / size, cy: sumY / size };
+  }
+  return best;
+}
+
+function showResult(found, fraction, blob) {
+  if (found) {
+    statusEl.textContent = '🐤 Канарейка обнаружена!';
+    statusEl.classList.add('found');
+  } else {
+    statusEl.textContent = 'Канарейки не видно';
+    statusEl.classList.remove('found');
+  }
+  debugEl.textContent =
+    `жёлтое: ${(fraction * 100).toFixed(1)}% кадра, ` +
+    `крупнейший блоб: ${blob.size} px ` +
+    `(центр ~${blob.cx.toFixed(0)}, ${blob.cy.toFixed(0)})`;
+}
+</script>
+</body>
+</html>
