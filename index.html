@@ -9,19 +9,21 @@
     margin: 0; font-family: system-ui, sans-serif;
     background: #111; color: #eee;
     display: flex; flex-direction: column; align-items: center;
-    min-height: 100vh;
+    min-height: 100vh; padding: 8px;
   }
   #video { width: 100%; max-width: 480px; border-radius: 8px; background: #000; }
   #status {
-    font-size: 1.3em; margin: 16px; padding: 12px 20px;
-    border-radius: 12px; background: #222; min-width: 220px; text-align: center;
+    font-size: 1.2em; margin: 10px; padding: 10px 18px;
+    border-radius: 12px; background: #222; text-align: center;
   }
   #status.found { background: #1b5e20; }
+  #debug { color: #888; font-size: 0.8em; margin: 6px; text-align: center; }
+  #panel { display: flex; gap: 10px; margin: 6px; flex-wrap: wrap; justify-content: center; }
   button {
-    font-size: 1.1em; padding: 12px 24px; border: none;
-    border-radius: 24px; background: #ffd54f; color: #222;
+    font-size: 1em; padding: 10px 18px; border: none;
+    border-radius: 20px; background: #ffd54f; color: #222;
   }
-  #debug { color: #888; font-size: 0.85em; margin: 8px; }
+  button.off { background: #444; color: #aaa; }
 </style>
 </head>
 <body>
@@ -29,135 +31,207 @@
 <video id="video" playsinline muted autoplay></video>
 <div id="status">Ожидание запуска…</div>
 <div id="debug"></div>
-<button id="btn">▶ Запустить камеру</button>
+<div id="panel">
+  <button id="btn">▶ Запустить камеру</button>
+  <button id="flip">📷 Сменить камеру</button>
+  <button id="sound" class="off">🔇 Звук: выкл</button>
+</div>
 
 <script>
 const video    = document.getElementById('video');
 const statusEl = document.getElementById('status');
 const debugEl  = document.getElementById('debug');
 const btn      = document.getElementById('btn');
+const flipBtn  = document.getElementById('flip');
+const soundBtn = document.getElementById('sound');
 
-// Канва — маленькая: меньше пикселей = меньше вычислений = меньше батарейки
-const W = 96, H = 72;
+const W = 160, H = 120;      // сетка покрупнее — чтобы ловить маленькую птицу
+const INTERVAL_MS  = 1500;   // проверка каждые 1,5 с
+const VOTES_NEEDED = 3;      // голосов из 5 последних кадров
+const COOLDOWN_MS  = 10000;  // пауза после тревоги
+
+let running = false, facing = 'environment', soundOn = false;
+let votes = [], lastAlarm = 0, prevCx = -1, prevCy = -1;
+
 const canvas = document.createElement('canvas');
 canvas.width = W; canvas.height = H;
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-const INTERVAL_MS = 2000;   // проверяем раз в 2 секунды
-let running = false;
-
 btn.addEventListener('click', start);
+flipBtn.addEventListener('click', flipCamera);
+soundBtn.addEventListener('click', () => {
+  soundOn = !soundOn;
+  soundBtn.textContent = soundOn ? '🔊 Звук: вкл' : '🔇 Звук: выкл';
+  soundBtn.classList.toggle('off', !soundOn);
+  if (soundOn) beep(150, 0.3, 880); // короткий тестовый писк
+});
 
-async function start() {
-  btn.disabled = true;
+// ---------- Пищалка: Web Audio, без файлов ----------
+let audioCtx = null;
+function beep(durationMs, volume, freq) {
   try {
-    // Низкое разрешение — камера потребляет заметно меньше энергии
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 320 }, height: { ideal: 240 },
-               frameRate: { ideal: 5, max: 15 } },
-      audio: false
-    });
-    video.srcObject = stream;
-    await video.play();
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine'; osc.frequency.value = freq;
+    gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + durationMs / 1000);
+  } catch (e) { /* звук недоступен — не страшно */ }
+}
 
-    // Подсказываем системе, что поток «фоновый» — на некоторых телефонах
-    // это снижает энергопотребление и частоту кадров
-    const track = stream.getVideoTracks()[0];
-    if (track && 'contentHint' in track) track.contentHint = 'motion';
+// ---------- Камера ----------
+async function start() {
+  btn.disabled = true; btn.textContent = '▶ Работает';
+  await openStream();
+  running = true;
+  statusEl.textContent = 'Ищу канарейку…';
+  setInterval(analyze, INTERVAL_MS);
+}
 
-    running = true;
-    statusEl.textContent = 'Ищу канарейку…';
-    setInterval(analyze, INTERVAL_MS);
-  } catch (e) {
-    statusEl.textContent = 'Нет доступа к камере: ' + e.message;
+async function openStream() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing,
+             width: { ideal: 320 }, height: { ideal: 240 },
+             frameRate: { ideal: 5, max: 15 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  const track = stream.getVideoTracks()[0];
+  if (track && 'contentHint' in track) track.contentHint = 'motion';
+}
+
+async function flipCamera() {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  flipBtn.textContent = facing === 'user' ? '🤳 Фронталка' : '📷 Сменить камеру';
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(t => t.stop());
+    try { await openStream(); } catch (e) {
+      statusEl.textContent = 'Не удалось переключить камеру';
+    }
   }
 }
 
-function analyze() {
-  if (!running) return;
+// ---------- Проверка формы пятна ----------
+function blobScore(b) {
+  const MIN_SIZE = 25;                    // маленькая канарейка — не отсекаем
+  if (b.size < MIN_SIZE) return 0;
+  if (b.size > W * H * 0.45) return 0;    // жёлтая стена — не птица
+  if (b.fill < 0.45) return 0;            // разреженные крапинки — шум
+  if (b.ratio > 3.2 || b.ratio < 0.31) return 0; // полосы и рамки — не птица
+  const ratioFit = 1 - Math.min(1, Math.abs(Math.log(b.ratio)) / Math.log(3.2));
+  const sizeBonus = Math.min(1, b.size / 400);
+  return b.fill * (0.6 + 0.4 * ratioFit) * (0.5 + 0.5 * sizeBonus);
+}
 
-  // Рисуем один кадр в мини-канву
+// ---------- Поиск связных пятен и их формы ----------
+function findBlobs(mask) {
+  const visited = new Uint8Array(W * H);
+  const blobs = [];
+  const stack = [];
+
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || visited[start]) continue;
+    stack.length = 0; stack.push(start);
+    visited[start] = 1;
+    let size = 0, sumX = 0, sumY = 0;
+    let minX = W, maxX = 0, minY = H, maxY = 0;
+
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % W, y = (p / W) | 0;
+      size++; sumX += x; sumY += y;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+
+      if (x > 0   && mask[p-1] && !visited[p-1]) { visited[p-1] = 1; stack.push(p-1); }
+      if (x < W-1 && mask[p+1] && !visited[p+1]) { visited[p+1] = 1; stack.push(p+1); }
+      if (y > 0   && mask[p-W] && !visited[p-W]) { visited[p-W] = 1; stack.push(p-W); }
+      if (y < H-1 && mask[p+W] && !visited[p+W]) { visited[p+W] = 1; stack.push(p+W); }
+    }
+
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    blobs.push({
+      size,
+      fill: size / (bw * bh),                            // плотность пятна
+      ratio: Math.max(bw, bh) / Math.min(bw, bh),        // вытянутость (1 = круглая)
+      cx: sumX / size, cy: sumY / size
+    });
+  }
+  return blobs;
+}
+
+// ---------- Голосование и тревога ----------
+function vote(found) {
+  votes.push(found);
+  if (votes.length > 5) votes.shift();
+
+  if (Date.now() - lastAlarm < COOLDOWN_MS) return;
+  const yes = votes.filter(Boolean).length;
+  if (yes >= VOTES_NEEDED) {
+    lastAlarm = Date.now();
+    votes = [];
+    if (soundOn) {
+      beep(200, 0.5, 1200);
+      setTimeout(() => beep(200, 0.5, 1200), 300);
+      setTimeout(() => beep(350, 0.5, 1500), 600);
+    }
+    setTimeout(() => statusEl.classList.remove('found'), 4000);
+  }
+}
+
+// ---------- Главный цикл ----------
+function analyze() {
+  if (!running || document.hidden) return; // в фоне — пауза, батарея целее
+
   ctx.drawImage(video, 0, 0, W, H);
   const data = ctx.getImageData(0, 0, W, H).data;
-
-  // Маска «жёлтого»: H в градусах 40–70, насыщенность и яркость выше порога
   const mask = new Uint8Array(W * H);
-  let yellowCount = 0;
 
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     const r = data[i], g = data[i+1], b = data[i+2];
     const max = Math.max(r, g, b), min = Math.min(r, g, b);
     const v = max / 255;
     const s = max === 0 ? 0 : (max - min) / max;
-
+    if (s <= 0.40 || v <= 0.30 || v >= 0.98) continue; // серое, тёмное, пересвет — мимо
     let h = 0;
     if (max !== min) {
       const d = max - min;
-      if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0));
-      else if (max === g) h = (b - r) / d + 2;
-      else                h = (r - g) / d + 4;
-      h *= 60;
+      if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
+      else if (max === g) h = ((b - r) / d + 2) * 60;
+      else                h = ((r - g) / d + 4) * 60;
     }
-
-    if (h >= 40 && h <= 70 && s > 0.45 && v > 0.35) {
-      mask[p] = 1;
-      yellowCount++;
-    }
+    if (h >= 38 && h <= 72) mask[p] = 1; // жёлтый диапазон
   }
 
-  const fraction = yellowCount / (W * H);
+  const blobs = findBlobs(mask);
 
-  // Считаем крупнейший связный «жёлтый» блоб простым flood fill
-  const biggest = largestBlob(mask);
-
-  // Канарейка: приличная доля жёлтого И блоб не крошечный и не весь экран
-  const found = fraction > 0.015 && biggest.size >= 12 && biggest.size < W * H * 0.5;
-
-  showResult(found, fraction, biggest);
-}
-
-function largestBlob(mask) {
-  const visited = new Uint8Array(W * H);
-  let best = { size: 0, cx: 0, cy: 0 };
-  const stack = [];
-
-  for (let start = 0; start < mask.length; start++) {
-    if (!mask[start] || visited[start]) continue;
-    stack.length = 0;
-    stack.push(start);
-    visited[start] = 1;
-    let size = 0, sumX = 0, sumY = 0;
-
-    while (stack.length) {
-      const p = stack.pop();
-      const x = p % W, y = (p / W) | 0;
-      size++; sumX += x; sumY += y;
-
-      // 4-связность, без выхода за границы
-      if (x > 0     && mask[p-1] && !visited[p-1]) { visited[p-1] = 1; stack.push(p-1); }
-      if (x < W-1   && mask[p+1] && !visited[p+1]) { visited[p+1] = 1; stack.push(p+1); }
-      if (y > 0     && mask[p-W] && !visited[p-W]) { visited[p-W] = 1; stack.push(p-W); }
-      if (y < H-1   && mask[p+W] && !visited[p+W]) { visited[p+W] = 1; stack.push(p+W); }
-    }
-
-    if (size > best.size) best = { size, cx: sumX / size, cy: sumY / size };
+  // Берём не самое большое, а самое «птицеподобное» пятно
+  let best = null, bestScore = 0;
+  for (const b of blobs) {
+    const score = blobScore(b);
+    if (score > bestScore) { bestScore = score; best = b; }
   }
-  return best;
-}
 
-function showResult(found, fraction, blob) {
-  if (found) {
-    statusEl.textContent = '🐤 Канарейка обнаружена!';
-    statusEl.classList.add('found');
-  } else {
-    statusEl.textContent = 'Канарейки не видно';
-    statusEl.classList.remove('found');
+  // Скачок центра пятна больше трети кадра = сменилась сцена, голоса зря
+  if (best && prevCx >= 0 && Math.hypot(best.cx - prevCx, best.cy - prevCy) > W / 3) {
+    votes = [];
   }
-  debugEl.textContent =
-    `жёлтое: ${(fraction * 100).toFixed(1)}% кадра, ` +
-    `крупнейший блоб: ${blob.size} px ` +
-    `(центр ~${blob.cx.toFixed(0)}, ${blob.cy.toFixed(0)})`;
+  if (best) { prevCx = best.cx; prevCy = best.cy; }
+
+  vote(!!best);
+
+  debugEl.textContent = blobs.length
+    ? `пятен: ${blobs.length}; лучший: ${best.size}px, запол. ${(best.fill * 100).toFixed(0)}%, проп. ${best.ratio.toFixed(2)}, оценка ${bestScore.toFixed(2)}`
+    : 'жёлтых пятен нет';
+
+  if (best) { statusEl.textContent = '🐤 Канарейка обнаружена!'; statusEl.classList.add('found'); }
+  else { statusEl.textContent = 'Канарейки не видно'; statusEl.classList.remove('found'); }
 }
 </script>
+
 </body>
 </html>
