@@ -25,28 +25,39 @@
   #debug { color: #888; font-size: 0.75em; margin: 4px; text-align: center; }
   #panel { display: flex; gap: 8px; margin: 6px; flex-wrap: wrap; justify-content: center; }
   button {
-    font-size: 0.95em; padding: 10px 16px; border: none;
+    font-size: 0.95em; padding: 10px 14px; border: none;
     border-radius: 20px; background: #ffd54f; color: #222;
   }
   button.off { background: #444; color: #aaa; }
 
-  /* Окно обучения по фото */
-  #trainModal {
+  /* Общая обёртка модальных окон */
+  .modal {
     display: none; position: fixed; inset: 0; z-index: 20;
-    background: rgba(0,0,0,.9);
-    flex-direction: column; align-items: center; justify-content: center; padding: 12px;
+    background: rgba(0,0,0,.93);
+    flex-direction: column; align-items: center; padding: 12px; overflow-y: auto;
   }
-  #trainModal.open { display: flex; }
-  #trainCanvas { max-width: 100%; max-height: 60vh; touch-action: none; border-radius: 6px; }
+  .modal.open { display: flex; }
+  #trainCanvas { max-width: 100%; max-height: 55vh; touch-action: none; border-radius: 6px; }
   #trainHint { margin: 10px; text-align: center; color: #ccc; font-size: 0.9em; }
-  #trainBtns { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  #trainBtns { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-bottom: 10px; }
   #trainBtns .ok { background: #4caf50; color: #fff; }
   #trainBtns .no { background: #f44336; color: #fff; }
+
+  /* Библиотека */
+  #libModal h3 { margin: 12px 0 6px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .cell { text-align: center; }
+  .cell img {
+    width: 96px; height: 96px; object-fit: cover;
+    border-radius: 6px; border: 2px solid #555;
+  }
+  .cell .cap { font-size: 0.65em; color: #999; max-width: 96px; overflow: hidden; }
+  .empty { color: #666; font-size: 0.9em; margin: 8px; }
 
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: #333; color: #fff; padding: 10px 18px; border-radius: 20px;
-    opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 30;
+    opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 40;
   }
   #toast.show { opacity: 1; }
 </style>
@@ -63,18 +74,31 @@
   <button id="btn">▶ Запустить камеру</button>
   <button id="flip">📷 Сменить камеру</button>
   <button id="sound" class="off">🔇 Звук: выкл</button>
+  <button id="libBtn">📚 Библиотека</button>
   <button id="photo">🖼 Обучить по фото</button>
   <button id="forget">🗑 Забыть обучение</button>
 </div>
 
-<div id="trainModal">
-  <div id="trainHint">Обведите канарейку прямоугольником пальцем/мышью,<br>затем выберите: это канарейка или на фото её нет</div>
+<!-- Окно обучения по фото -->
+<div id="trainModal" class="modal">
+  <div id="trainHint">Обведите канарейку рамкой, затем нажмите кнопку.<br>Можно загрузить сразу несколько фото — они пойдут по очереди.</div>
   <canvas id="trainCanvas"></canvas>
   <div id="trainBtns">
-    <button class="ok" id="trainPos">✓ Здесь канарейка</button>
+    <button class="ok" id="trainPos">✓ В рамке канарейка</button>
     <button class="no" id="trainNeg">✗ Канарейки нет</button>
     <button id="trainClose">Закрыть</button>
   </div>
+</div>
+
+<!-- Окно библиотеки -->
+<div id="libModal" class="modal">
+  <h3>📚 Снимки при срабатываниях</h3>
+  <div class="grid" id="snapGrid"></div>
+  <h3>✓ Примеры «канарейка»</h3>
+  <div class="grid" id="posGrid"></div>
+  <h3>✗ Примеры «не канарейка»</h3>
+  <div class="grid" id="negGrid"></div>
+  <button id="libClose" style="margin:16px">Закрыть</button>
 </div>
 
 <div id="toast"></div>
@@ -89,6 +113,7 @@ const debugEl  = document.getElementById('debug');
 const btn      = document.getElementById('btn');
 const flipBtn  = document.getElementById('flip');
 const soundBtn = document.getElementById('sound');
+const libBtn   = document.getElementById('libBtn');
 const photoBtn = document.getElementById('photo');
 const forgetBtn= document.getElementById('forget');
 const toastEl  = document.getElementById('toast');
@@ -96,11 +121,12 @@ const toastEl  = document.getElementById('toast');
 const W = 160, H = 120;
 const INTERVAL_MS  = 1200;
 const EMA_ALPHA    = 0.45;
-const TRIGGER_EMA  = 0.33;
+const TRIGGER_EMA  = 0.25;   // опустил с 0.33 — детектор срабатывает охотнее
 const RAW_HITS     = 2;
 const COOLDOWN_MS  = 8000;
 const TAP_RADIUS   = 7;
 const MAX_SAMPLES  = 30;
+const MAX_SNAPS    = 24;     // сколько снимков храним
 
 let running = false, started = false;
 let facing = 'environment', soundOn = false;
@@ -109,16 +135,22 @@ let prevCx = -1, prevCy = -1;
 let emaScore = 0;
 const rawVotes = [];
 
-// ---------- Память обучения ----------
-const LEARN_KEY = 'canary_learn_v2';
-const PREFS_KEY = 'canary_prefs_v2';
-let learn = { pos: [], neg: [] };
+// ---------- Хранилища: обучение и снимки (localStorage — не сбрасывается) ----------
+const LEARN_KEY = 'canary_learn_v3';
+const PREFS_KEY = 'canary_prefs_v3';
+const SNAPS_KEY = 'canary_snaps_v3';
+
+let learn = { pos: [], neg: [] }; // каждый элемент: {hist: [...], thumb: dataURL}
+let snaps = [];                    // каждый элемент: {img: dataURL, t: число}
 
 try {
   const saved = JSON.parse(localStorage.getItem(LEARN_KEY));
   if (saved && Array.isArray(saved.pos) && Array.isArray(saved.neg)) learn = saved;
 } catch (e) {}
+try { snaps = JSON.parse(localStorage.getItem(SNAPS_KEY)) || []; } catch (e) {}
+
 function saveLearn() { try { localStorage.setItem(LEARN_KEY, JSON.stringify(learn)); } catch (e) {} }
+function saveSnaps() { try { localStorage.setItem(SNAPS_KEY, JSON.stringify(snaps)); } catch (e) {} }
 
 try {
   const prefs = JSON.parse(localStorage.getItem(PREFS_KEY)) || {};
@@ -187,7 +219,7 @@ soundBtn.addEventListener('click', () => {
 forgetBtn.addEventListener('click', () => {
   learn = { pos: [], neg: [] };
   saveLearn();
-  showToast('Обучение сброшено');
+  showToast('Обучение сброшено (снимки остались)');
 });
 
 // ---------- Камера: устойчивый запуск ----------
@@ -205,7 +237,7 @@ async function start() {
   } catch (e) {
     btn.disabled = false; btn.textContent = '▶ Запустить камеру';
     let msg = 'Не удалось запустить камеру: ' + (e.message || e);
-    if (e && e.name === 'NotAllowedError') msg = 'Доступ к камере запрещён. Разрешите камеру в настройках сайта (иконка слева от адреса) и попробуйте снова.';
+    if (e && e.name === 'NotAllowedError') msg = 'Доступ к камере запрещён. Разрешите камеру в настройках сайта и попробуйте снова.';
     if (e && e.name === 'NotFoundError') msg = 'Камера не найдена на этом устройстве.';
     statusEl.textContent = msg;
   }
@@ -220,12 +252,15 @@ async function openStream() {
     audio: false
   });
   video.srcObject = stream;
-  await video.play();
+  // Ждём, пока видео реально начнёт отдавать кадры
+  if (video.readyState < 2) {
+    await new Promise(res => video.addEventListener('loadeddata', res, { once: true }));
+  }
+  try { await video.play(); } catch (e) { /* некоторые браузеры сами запускают */ }
   const track = stream.getVideoTracks()[0];
   if (track && 'contentHint' in track) track.contentHint = 'motion';
 }
 
-// Оверлей подстраиваем под реальный размер видео, как только оно готово
 video.addEventListener('loadedmetadata', () => {
   overlay.width  = video.videoWidth  || 640;
   overlay.height = video.videoHeight || 480;
@@ -243,7 +278,7 @@ async function flipCamera() {
 }
 flipBtn.addEventListener('click', flipCamera);
 
-// ---------- Скользящее усреднение кадра ----------
+// ---------- Рабочая сетка и скользящее усреднение ----------
 const avgR = new Float32Array(W * H);
 const avgG = new Float32Array(W * H);
 const avgB = new Float32Array(W * H);
@@ -253,7 +288,11 @@ const workCanvas = document.createElement('canvas');
 workCanvas.width = W; workCanvas.height = H;
 const ctx = workCanvas.getContext('2d', { willReadFrequently: true });
 
-// ---------- Цветовые гистограммы (отпечатки) ----------
+// Канва для снимков и превью
+const snapCanvas = document.createElement('canvas');
+const snapCtx = snapCanvas.getContext('2d');
+
+// ---------- Цветовые гистограммы ----------
 const HBINS = 12, SBINS = 3, VBINS = 3;
 function hsvOf(r, g, b) {
   const max = Math.max(r, g, b), min = Math.min(r, g, b);
@@ -268,13 +307,12 @@ function hsvOf(r, g, b) {
   }
   return [h, s, v];
 }
-// Отпечаток из набора пикселей; цветные пиксели с шагом 2 — быстро и достаточно
 function buildHist(collect) {
   const hist = new Float32Array(HBINS * SBINS * VBINS);
   let n = 0;
   for (const [r, g, b] of collect) {
     const [h, s, v] = hsvOf(r, g, b);
-    if (s <= 0.15 || v <= 0.15) continue;
+    if (s <= 0.12 || v <= 0.12) continue;
     const hi = Math.min(HBINS - 1, h / 30 | 0);
     const si = Math.min(SBINS - 1, s * SBINS | 0);
     const vi = Math.min(VBINS - 1, v * VBINS | 0);
@@ -285,7 +323,6 @@ function buildHist(collect) {
   for (let i = 0; i < hist.length; i++) hist[i] /= n;
   return hist;
 }
-// Отпечаток пятна с камеры (по маске)
 function histFromBlob(blob, mask) {
   const collect = [];
   for (let y = blob.minY; y <= blob.maxY; y++)
@@ -295,7 +332,6 @@ function histFromBlob(blob, mask) {
     }
   return buildHist(collect);
 }
-// Отпечаток области вокруг тапа
 function histFromTap(gx, gy) {
   const collect = [];
   for (let y = Math.max(0, gy - TAP_RADIUS); y <= Math.min(H - 1, gy + TAP_RADIUS); y++)
@@ -311,12 +347,36 @@ function sim(a, b) {
 function learnedScore(hist) {
   if (!hist || (learn.pos.length === 0 && learn.neg.length === 0)) return null;
   let posBest = 0, negBest = 0;
-  for (const h of learn.pos) posBest = Math.max(posBest, sim(hist, h));
-  for (const h of learn.neg) negBest = Math.max(negBest, sim(hist, h));
+  for (const e of learn.pos) posBest = Math.max(posBest, sim(hist, e.hist));
+  for (const e of learn.neg) negBest = Math.max(negBest, sim(hist, e.hist));
   return Math.max(0, Math.min(1, 0.5 + (posBest - negBest) * 1.5));
 }
 
-// ---------- Тапы по живому видео: РАМКА = канарейка ----------
+// Превью для примера обучения: рисуем область сетки укрупнённо
+function thumbFromCells(x0, y0, x1, y1, mask, size) {
+  size = size || 64;
+  snapCanvas.width = size; snapCanvas.height = size;
+  snapCtx.fillStyle = '#000'; snapCtx.fillRect(0, 0, size, size);
+  const cw = Math.max(1, (size / (x1 - x0 + 1)) | 0);
+  const ch = Math.max(1, (size / (y1 - y0 + 1)) | 0);
+  for (let y = y0; y <= y1; y++)
+    for (let x = x0; x <= x1; x++) {
+      const p = y * W + x;
+      if (mask && !mask[p]) continue;
+      snapCtx.fillStyle = `rgb(${avgR[p] | 0},${avgG[p] | 0},${avgB[p] | 0})`;
+      snapCtx.fillRect((x - x0) * cw, (y - y0) * ch, cw, ch);
+    }
+  return snapCanvas.toDataURL('image/jpeg', 0.6);
+}
+
+function addLearn(isPos, hist, thumb) {
+  const arr = isPos ? learn.pos : learn.neg;
+  arr.push({ hist: Array.from(hist), thumb });
+  if (arr.length > MAX_SAMPLES) arr.shift();
+  saveLearn();
+}
+
+// ---------- Тапы по живому видео: рамка = канарейка ----------
 let flashUntil = 0, flashBox = null, flashColor = '#4f4', flashPoint = null;
 function flashRect(b, color) { flashBox = b; flashColor = color; flashPoint = null; flashUntil = Date.now() + 1200; }
 function flashTap(gx, gy, color) { flashPoint = [gx, gy]; flashColor = color; flashBox = null; flashUntil = Date.now() + 1200; }
@@ -330,82 +390,93 @@ overlay.addEventListener('pointerdown', (e) => {
 
   const hit = lastBlobs.find(b => gx >= b.minX && gx <= b.maxX && gy >= b.minY && gy <= b.maxY);
   if (hit) {
-    // Тап по рамке → «это канарейка»
     const hist = histFromBlob(hit, lastMask);
     if (hist) {
-      learn.pos.push(hist);
-      if (learn.pos.length > MAX_SAMPLES) learn.pos.shift();
-      saveLearn();
+      const thumb = thumbFromCells(hit.minX, hit.minY, hit.maxX, hit.maxY, lastMask);
+      addLearn(true, hist, thumb);
       showToast('✓ Запомнил: канарейка (' + learn.pos.length + ')');
       flashRect(hit, '#4f4');
     }
   } else {
-    // Тап мимо рамок → «здесь не канарейка»
     const hist = histFromTap(gx, gy);
     if (hist) {
-      learn.neg.push(hist);
-      if (learn.neg.length > MAX_SAMPLES) learn.neg.shift();
-      saveLearn();
+      const thumb = thumbFromCells(Math.max(0, gx - TAP_RADIUS), Math.max(0, gy - TAP_RADIUS),
+                                   Math.min(W - 1, gx + TAP_RADIUS), Math.min(H - 1, gy + TAP_RADIUS), null);
+      addLearn(false, hist, thumb);
       showToast('✗ Запомнил: НЕ канарейка (' + learn.neg.length + ')');
       flashTap(gx, gy, '#f44');
     } else showToast('Слишком темно, нечего запоминать');
   }
 });
 
-// ---------- Обучение по загруженным фото ----------
+// ---------- Обучение по фото: несколько файлов подряд ----------
 const trainModal  = document.getElementById('trainModal');
 const trainCanvas = document.getElementById('trainCanvas');
 const trainCtx    = trainCanvas.getContext('2d');
 const fileInput   = document.getElementById('fileInput');
-let trainImg = null, trainScale = 1, dragStart = null, dragNow = null;
+const trainHint   = document.getElementById('trainHint');
+let photoQueue = [];   // очередь загруженных файлов
+let trainImg = null, dragStart = null, dragNow = null;
 
 photoBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
-  if (!fileInput.files || !fileInput.files[0]) return;
-  const file = fileInput.files[0];
+  if (!fileInput.files || !fileInput.files.length) return;
+  photoQueue = Array.from(fileInput.files);
+  fileInput.value = '';
+  nextPhoto();
+});
+
+function nextPhoto() {
+  if (!photoQueue.length) { trainModal.classList.remove('open'); return; }
+  const file = photoQueue.shift();
   const url = URL.createObjectURL(file);
   const img = new Image();
   img.onload = () => {
     trainImg = img;
     const maxW = 640;
-    trainScale = Math.min(1, maxW / img.width);
-    trainCanvas.width  = img.width  * trainScale;
-    trainCanvas.height = img.height * trainScale;
+    const scale = Math.min(1, maxW / img.width);
+    trainCanvas.width  = img.width  * scale;
+    trainCanvas.height = img.height * scale;
     trainCtx.drawImage(img, 0, 0, trainCanvas.width, trainCanvas.height);
     dragStart = dragNow = null;
+    trainHint.textContent = 'Осталось фото: ' + photoQueue.length +
+      '. Обведите канарейку рамкой → «В рамке канарейка», или «Канарейки нет» для фона.';
     trainModal.classList.add('open');
     URL.revokeObjectURL(url);
   };
+  img.onerror = () => { URL.revokeObjectURL(url); nextPhoto(); };
   img.src = url;
-  fileInput.value = '';
-});
+}
 
-function trainPos(e) {
+function trainCoords(e) {
   const r = trainCanvas.getBoundingClientRect();
   return [(e.clientX - r.left) * (trainCanvas.width / r.width),
           (e.clientY - r.top)  * (trainCanvas.height / r.height)];
 }
-trainCanvas.addEventListener('pointerdown', e => { dragStart = trainPos(e); dragNow = dragStart; trainCanvas.setPointerCapture(e.pointerId); });
+trainCanvas.addEventListener('pointerdown', e => {
+  dragStart = trainCoords(e); dragNow = dragStart;
+  trainCanvas.setPointerCapture(e.pointerId);
+});
 trainCanvas.addEventListener('pointermove', e => {
   if (!dragStart) return;
-  dragNow = trainPos(e);
+  dragNow = trainCoords(e);
   trainCtx.drawImage(trainImg, 0, 0, trainCanvas.width, trainCanvas.height);
-  const x = Math.min(dragStart[0], dragNow[0]), y = Math.min(dragStart[1], dragNow[1]);
-  const w = Math.abs(dragNow[0] - dragStart[0]), h = Math.abs(dragNow[1] - dragStart[1]);
   trainCtx.lineWidth = 3; trainCtx.strokeStyle = '#4f4';
-  trainCtx.strokeRect(x, y, w, h);
+  trainCtx.strokeRect(Math.min(dragStart[0], dragNow[0]), Math.min(dragStart[1], dragNow[1]),
+                      Math.abs(dragNow[0] - dragStart[0]), Math.abs(dragNow[1] - dragStart[1]));
 });
-trainCanvas.addEventListener('pointerup', () => {});
 
 function saveFromPhoto(isPos) {
   if (!trainImg) return;
   let rect;
   if (isPos) {
-    if (!dragStart || !dragNow) { showToast('Сначала обведите канарейку'); return; }
+    if (!dragStart || !dragNow || Math.abs(dragNow[0]-dragStart[0]) < 8 || Math.abs(dragNow[1]-dragStart[1]) < 8) {
+      showToast('Сначала обведите канарейку рамкой'); return;
+    }
     rect = [Math.min(dragStart[0], dragNow[0]), Math.min(dragStart[1], dragNow[1]),
             Math.max(dragStart[0], dragNow[0]), Math.max(dragStart[1], dragNow[1])];
   } else {
-    rect = [0, 0, trainCanvas.width, trainCanvas.height]; // весь кадр как «не канарейка»
+    rect = [0, 0, trainCanvas.width, trainCanvas.height];
   }
   const data = trainCtx.getImageData(0, 0, trainCanvas.width, trainCanvas.height).data;
   const collect = [];
@@ -417,21 +488,84 @@ function saveFromPhoto(isPos) {
     }
   const hist = buildHist(collect);
   if (!hist) { showToast('Не получилось извлечь цвета'); return; }
-  if (isPos) {
-    learn.pos.push(hist);
-    if (learn.pos.length > MAX_SAMPLES) learn.pos.shift();
-    showToast('✓ Канарейка с фото запомнена (' + learn.pos.length + ')');
-  } else {
-    learn.neg.push(hist);
-    if (learn.neg.length > MAX_SAMPLES) learn.neg.shift();
-    showToast('✗ Кадр без канарейки запомнен (' + learn.neg.length + ')');
-  }
-  saveLearn();
-  trainModal.classList.remove('open');
+
+  // Превью обведённой области (или всего кадра для отрицательного)
+  const tw = 64, th = Math.max(1, (rect[3] - rect[1]) / (rect[2] - rect[0]) * tw) | 0;
+  snapCanvas.width = tw; snapCanvas.height = th;
+  snapCtx.drawImage(trainCanvas, rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1], 0, 0, tw, th);
+  const thumb = snapCanvas.toDataURL('image/jpeg', 0.6);
+
+  addLearn(isPos, hist, thumb);
+  showToast(isPos ? '✓ Канарейка запомнена (' + learn.pos.length + ')'
+                  : '✗ Фон без канарейки запомнен (' + learn.neg.length + ')');
+  nextPhoto(); // следующее фото из очереди или закрытие
 }
 document.getElementById('trainPos').addEventListener('click', () => saveFromPhoto(true));
 document.getElementById('trainNeg').addEventListener('click', () => saveFromPhoto(false));
-document.getElementById('trainClose').addEventListener('click', () => trainModal.classList.remove('open'));
+document.getElementById('trainClose').addEventListener('click', () => { photoQueue = []; trainModal.classList.remove('open'); });
+
+// ---------- Снимок при срабатывании ----------
+function captureSnapshot() {
+  try {
+    const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+    const w = 320, h = (vh / vw * w) | 0;
+    snapCanvas.width = w; snapCanvas.height = h;
+    snapCtx.drawImage(video, 0, 0, w, h);
+    snaps.push({ img: snapCanvas.toDataURL('image/jpeg', 0.55), t: Date.now() });
+    if (snaps.length > MAX_SNAPS) snaps.shift();
+    saveSnaps();
+  } catch (e) { /* снимок не критичен */ }
+}
+
+// ---------- Библиотека ----------
+const libModal  = document.getElementById('libModal');
+const snapGrid  = document.getElementById('snapGrid');
+const posGrid   = document.getElementById('posGrid');
+const negGrid   = document.getElementById('negGrid');
+
+function renderCell(gridEl, thumb, caption, onDelete) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  const img = document.createElement('img');
+  img.src = thumb;
+  if (onDelete) {
+    img.addEventListener('click', onDelete);
+    img.style.cursor = 'pointer';
+    img.title = 'Нажмите, чтобы удалить';
+  }
+  const cap = document.createElement('div');
+  cap.className = 'cap'; cap.textContent = caption;
+  cell.appendChild(img); cell.appendChild(cap);
+  gridEl.appendChild(cell);
+}
+function renderEmpty(gridEl, text) {
+  const d = document.createElement('div');
+  d.className = 'empty'; d.textContent = text;
+  gridEl.appendChild(d);
+}
+
+libBtn.addEventListener('click', () => {
+  snapGrid.innerHTML = posGrid.innerHTML = negGrid.innerHTML = '';
+  if (snaps.length)
+    for (let i = snaps.length - 1; i >= 0; i--)
+      renderCell(snapGrid, snaps[i].img,
+        new Date(snaps[i].t).toLocaleTimeString('ru-RU'),
+        () => { snaps.splice(i, 1); saveSnaps(); libBtn.click(); showToast('Снимок удалён'); });
+  else renderEmpty(snapGrid, 'Пока пусто — снимки появляются при срабатывании пищалки');
+
+  if (learn.pos.length)
+    learn.pos.forEach((e, i) => renderCell(posGrid, e.thumb, '№' + (i + 1),
+      () => { learn.pos.splice(i, 1); saveLearn(); libBtn.click(); showToast('Пример удалён'); }));
+  else renderEmpty(posGrid, 'Тапайте по рамке на живой камере или обводите на фото');
+
+  if (learn.neg.length)
+    learn.neg.forEach((e, i) => renderCell(negGrid, e.thumb, '№' + (i + 1),
+      () => { learn.neg.splice(i, 1); saveLearn(); libBtn.click(); showToast('Пример удалён'); }));
+  else renderEmpty(negGrid, 'Тапайте мимо рамок — фон запомнится как «не канарейка»');
+
+  libModal.classList.add('open');
+});
+document.getElementById('libClose').addEventListener('click', () => libModal.classList.remove('open'));
 
 // ---------- Освещение ----------
 function medianLum() {
@@ -448,14 +582,14 @@ function medianLum() {
 
 // ---------- Форма пятна ----------
 function blobScore(b, lum) {
-  const minSize = lum < 0.35 ? 18 : 22;
+  const minSize = lum < 0.35 ? 16 : 20;   // мягче прежнего
   if (b.size < minSize) return 0;
   if (b.size > W * H * 0.5) return 0;
-  if (b.fill < 0.42) return 0;
-  if (b.ratio > 2.8) return 0;
-  const ratioFit = 1 - Math.min(1, Math.log(b.ratio) / Math.log(2.8));
-  const sizeBonus = Math.min(1, Math.sqrt(b.size / 500));
-  return b.fill * (0.55 + 0.45 * ratioFit) * (0.5 + 0.5 * sizeBonus);
+  if (b.fill < 0.38) return 0;            // мягче прежнего
+  if (b.ratio > 3.0) return 0;
+  const ratioFit = 1 - Math.min(1, Math.log(b.ratio) / Math.log(3.0));
+  const sizeBonus = Math.min(1, Math.sqrt(b.size / 400));
+  return b.fill * (0.55 + 0.45 * ratioFit) * (0.55 + 0.45 * sizeBonus);
 }
 
 // ---------- Поиск связных пятен ----------
@@ -501,6 +635,7 @@ function dilate(mask) {
 // ---------- Рамки на экране ----------
 function drawOverlay() {
   const vw = overlay.width, vh = overlay.height;
+  if (!vw) return;
   octx.clearRect(0, 0, vw, vh);
   if (!running) return;
   const sx = vw / W, sy = vh / H;
@@ -536,7 +671,8 @@ function drawOverlay() {
 let lastBlobs = [], lastMask = new Uint8Array(W * H), bestBlob = null;
 
 function analyze() {
-  if (!running || document.hidden || !video.videoWidth) return;
+  if (!running || document.hidden) return;
+  if (!video.videoWidth || video.readyState < 2) return; // камера ещё не готова — ждём
 
   ctx.drawImage(video, 0, 0, W, H);
   const data = ctx.getImageData(0, 0, W, H).data;
@@ -550,8 +686,8 @@ function analyze() {
   avgReady = true;
 
   const lum = medianLum();
-  const vMin = Math.min(0.55, Math.max(0.22, lum * 0.55));
-  const sMin = lum > 0.75 ? 0.32 : 0.38;
+  const vMin = Math.min(0.5, Math.max(0.20, lum * 0.5));
+  const sMin = lum > 0.75 ? 0.28 : 0.34;
 
   const mask = new Uint8Array(W * H);
   for (let p = 0; p < W * H; p++) {
@@ -572,7 +708,7 @@ function analyze() {
       const ls = learnedScore(hist);
       if (ls !== null) {
         if (ls < 0.15 && learn.neg.length > 0) score = 0;
-        else score *= (0.25 + 1.5 * ls);
+        else score *= (0.3 + 1.4 * ls);
       }
     }
     b.score = score;
@@ -595,21 +731,21 @@ function analyze() {
   if (emaScore >= TRIGGER_EMA && rawHits >= RAW_HITS && now - lastAlarm > COOLDOWN_MS) {
     lastAlarm = now;
     setAlarm(true);
+    captureSnapshot(); // фото в библиотеку при каждом срабатывании
   }
   if (emaScore < TRIGGER_EMA * 0.5) setAlarm(false);
 
   if (best) { statusEl.textContent = '🐤 Канарейка обнаружена!'; statusEl.classList.add('found'); }
   else {
     statusEl.classList.remove('found');
-    if (!alarmActive) statusEl.textContent = 'Канарейки не видно';
-    else statusEl.textContent = '🐤 Канарейка (уходит из кадра)';
+    statusEl.textContent = alarmActive ? '🐤 Канарейка (уходит из кадра)' : 'Канарейки не видно';
   }
 
   debugEl.textContent =
     (blobs.length
       ? `пятен: ${blobs.length}, оценка ${best ? (bestScore * 100 | 0) : 0}, сыр ${rawHits}/5, сглаж ${emaScore.toFixed(2)}, свет ${lum.toFixed(2)}`
       : `жёлтого нет (свет ${lum.toFixed(2)})`)
-    + ` — обучение: ✓${learn.pos.length} ✗${learn.neg.length}`;
+    + ` — снимков: ${snaps.length}, обучение: ✓${learn.pos.length} ✗${learn.neg.length}`;
 
   drawOverlay();
 }
