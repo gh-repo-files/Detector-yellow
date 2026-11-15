@@ -1,22 +1,19 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>Детектор канарейки 🐤</title>
 <style>
-  * { box-sizing: border-box; }
+  * { -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; }
   body {
-    margin: 0; padding: 8px; min-height: 100vh;
-    font-family: system-ui, sans-serif;
     background: #111; color: #eee;
     display: flex; flex-direction: column; align-items: center;
+    font-family: system-ui, sans-serif; min-height: 100vh;
   }
   .camwrap { position: relative; width: 100%; max-width: 480px; }
-  #video {
-    width: 100%; display: block; border-radius: 8px;
-    background: #000; transform: scaleX(1);
-  }
+  #video { width: 100%; display: block; border-radius: 8px; background: #000; }
   #overlay {
     position: absolute; inset: 0; width: 100%; height: 100%;
     touch-action: none; cursor: crosshair;
@@ -59,13 +56,14 @@
   #trainCanvas {
     max-width: 100%; max-height: 55vh;
     touch-action: none; border-radius: 6px;
+    background: #000;
   }
   #trainHint {
     margin: 10px; text-align: center; color: #ccc;
     font-size: .9em; max-width: 600px;
   }
   #trainBtns {
-    display: flex; gap: 10px; flex-wrap: wrap;
+    display: flex; gap: 8px; flex-wrap: wrap;
     justify-content: center; margin-bottom: 10px;
   }
   #trainBtns .ok { background: #4caf50; color: #fff; }
@@ -93,7 +91,7 @@
 </head>
 <body>
 
-<div class="camwrap">
+<div class="camwrap" id="camwrap">
   <video id="video" playsinline muted autoplay></video>
   <canvas id="overlay"></canvas>
 </div>
@@ -113,6 +111,8 @@
   <button id="sound" class="off">🔇 Звук: выкл</button>
   <button id="libBtn">📚 Библиотека</button>
   <button id="photo">🖼 Обучить по фото</button>
+  <button id="dsExport">⬇ Скачать набор</button>
+  <button id="dsImport">⬆ Загрузить набор</button>
   <button id="forget">🗑 Забыть обучение</button>
 </div>
 
@@ -122,7 +122,11 @@
   <div id="trainBtns">
     <button class="ok" id="trainPos">✓ В контуре канарейка</button>
     <button class="no" id="trainNeg">✗ Канарейки нет</button>
+    <button id="trainPan">✋ Сдвинуть</button>
+    <button id="trainUndo">↩ Точку назад</button>
     <button id="trainClear">↺ Стереть контур</button>
+    <button id="trainZoomIn">🔍+</button>
+    <button id="trainZoomOut">🔍−</button>
     <button id="trainClose">Закрыть</button>
   </div>
 </div>
@@ -139,12 +143,14 @@
 
 <div id="toast"></div>
 <input type="file" id="fileInput" accept="image/*" multiple hidden>
+<input type="file" id="dsFile" accept=".json,application/json" hidden>
 
 <script>
 'use strict';
 
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
+const camwrap = document.getElementById('camwrap');
 const octx = overlay.getContext('2d');
 const statusEl = document.getElementById('status');
 const debugEl = document.getElementById('debug');
@@ -166,10 +172,13 @@ const TAP_RADIUS = 10;
 const HOLD_MS = 600;
 const MAX_SAMPLES = 25;
 const MAX_SNAPS = 20;
+const DILATE_PASSES = 2;
+const MERGE_PAD = 4;
 
 let triggerEMA = 0.225;
 let running = false;
 let facing = 'environment';
+let mirror = false;
 let soundOn = false;
 let alarmActive = false;
 let lastAlarm = 0;
@@ -266,6 +275,12 @@ sensEl.addEventListener('input', () => {
   applySensitivity();
   savePrefs();
 });
+
+function applyMirror() {
+  mirror = facing === 'user';
+  camwrap.style.transform = mirror ? 'scaleX(-1)' : 'none';
+}
+applyMirror();
 
 function resetDetectionState() {
   emaScore = 0;
@@ -390,6 +405,7 @@ function rebuildLUTs() {
   }
 }
 function extractPalette(pixels, count = 6) {
+  if (!pixels.length) return [];
   const counts = new Uint16Array(LUT_SIZE);
   for (const px of pixels) counts[lutIndex(px[0] | 0, px[1] | 0, px[2] | 0)]++;
   const order = [];
@@ -443,7 +459,16 @@ function sim(a, b) {
   return score;
 }
 function learnedScore(hist) {
-  if (!hist || (!learn.pos.length && !learn.neg.length)) return null;
+  if (!hist) return null;
+  if (!learn.pos.length && !learn.neg.length) return null;
+  // Если позитивов ещё нет — негативы только мягко штрафуют, а не убивают пятно.
+  if (!learn.pos.length) {
+    let negBest = 0;
+    for (const sample of learn.neg) {
+      if (sample.hist) negBest = Math.max(negBest, sim(hist, sample.hist));
+    }
+    return Math.max(0, Math.min(1, 1 - negBest * 1.5));
+  }
   let posBest = 0, negBest = 0;
   for (const sample of learn.pos) {
     if (sample.hist) posBest = Math.max(posBest, sim(hist, sample.hist));
@@ -597,6 +622,7 @@ flipBtn.addEventListener('click', async () => {
   if (wasRunning) stopCamera();
   facing = facing === 'environment' ? 'user' : 'environment';
   flipBtn.textContent = facing === 'user' ? '🤳 Фронтальная камера' : '📷 Сменить камеру';
+  applyMirror();
   savePrefs();
   clearBuffers();
   if (wasRunning) await startCamera();
@@ -608,7 +634,6 @@ video.addEventListener('loadedmetadata', () => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && running) {
-    // Пауза обработки в analyze; поток оставляем, чтобы быстрее продолжить.
     setAlarm(false);
   }
 });
@@ -628,6 +653,66 @@ document.getElementById('forget').addEventListener('click', () => {
   showToast('Обучение сброшено');
 });
 
+// Dataset export / import
+document.getElementById('dsExport').addEventListener('click', () => {
+  if (!learn.pos.length && !learn.neg.length) {
+    return showToast('Набор пуст — сначала обучите детектор');
+  }
+  const data = {
+    app: 'canary-detector',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    pos: learn.pos,
+    neg: learn.neg
+  };
+  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'canary_dataset.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  showToast('Набор сохранён файлом canary_dataset.json');
+});
+const dsFile = document.getElementById('dsFile');
+document.getElementById('dsImport').addEventListener('click', () => dsFile.click());
+dsFile.addEventListener('change', () => {
+  const file = dsFile.files && dsFile.files[0];
+  dsFile.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data || !Array.isArray(data.pos) || !Array.isArray(data.neg)) {
+        throw new Error('bad format');
+      }
+      let added = 0;
+      for (const key of ['pos', 'neg']) {
+        for (const s of data[key]) {
+          if (!s || !Array.isArray(s.hist)) continue;
+          learn[key].push({
+            hist: s.hist.map(Number),
+            thumb: typeof s.thumb === 'string' ? s.thumb : '',
+            pal: Array.isArray(s.pal) ? s.pal : null
+          });
+          if (learn[key].length > MAX_SAMPLES) learn[key].shift();
+          added++;
+        }
+      }
+      if (!added) throw new Error('empty');
+      saveLearn();
+      rebuildLUTs();
+      showToast(`Набор загружен: +${added} примеров`);
+    } catch {
+      showToast('Не удалось прочитать файл набора');
+    }
+  };
+  reader.onerror = () => showToast('Не удалось прочитать файл набора');
+  reader.readAsText(file);
+});
+
 // Pointer training from live camera
 function flashRect(blob, color) {
   flashBox = blob; flashPoint = null; flashColor = color;
@@ -637,16 +722,62 @@ function flashTap(x, y, color) {
   flashPoint = [x, y]; flashBox = null; flashColor = color;
   flashUntil = Date.now() + 1200;
 }
+
+// Тап теперь «умный»: точное пятно → ближайшее пятно → локальный кластер маски.
+function blobFromCluster(gx, gy) {
+  const R = 14;
+  let count = 0, minX = W, maxX = 0, minY = H, maxY = 0;
+  let sumMot = 0, sumGrad = 0;
+  for (let y = Math.max(0, gy - R); y <= Math.min(H - 1, gy + R); y++) {
+    for (let x = Math.max(0, gx - R); x <= Math.min(W - 1, gx + R); x++) {
+      const p = y * W + x;
+      if (!lastMask[p]) continue;
+      count++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      sumMot += motionEMA[p];
+      sumGrad += gradBuf[p];
+    }
+  }
+  if (count < 15) return null;
+  const bw = maxX - minX + 1, bh = maxY - minY + 1;
+  return {
+    size: count,
+    fill: count / (bw * bh),
+    ratio: Math.max(bw, bh) / Math.max(1, Math.min(bw, bh)),
+    cx: gx, cy: gy,
+    minX, maxX, minY, maxY,
+    motionAvg: sumMot / count,
+    gradAvg: sumGrad / count,
+    score: 0, ls: null
+  };
+}
+function findTapTarget(gx, gy) {
+  let best = null, bestD = Infinity;
+  for (const b of lastBlobs) {
+    if (b.size < 4) continue;
+    const dx = Math.max(b.minX - gx, 0, gx - b.maxX);
+    const dy = Math.max(b.minY - gy, 0, gy - b.maxY);
+    if (dx === 0 && dy === 0) return b; // тап внутри пятна
+    const d = Math.hypot(dx, dy);
+    if (d <= 12 && d < bestD) { bestD = d; best = b; }
+  }
+  return best || blobFromCluster(gx, gy);
+}
+
 overlay.addEventListener('contextmenu', e => e.preventDefault());
 overlay.addEventListener('pointerdown', e => {
   if (!running || !buffersReady || !overlay.width) return;
   const rect = overlay.getBoundingClientRect();
-  const gx = Math.floor((e.clientX - rect.left) / rect.width * W);
-  const gy = Math.floor((e.clientY - rect.top) / rect.height * H);
-  if (gx < 0 || gy < 0 || gx >= W || gy >= H) return;
-  const hit = lastBlobs.find(b =>
-    gx >= b.minX && gx <= b.maxX && gy >= b.minY && gy <= b.maxY
-  );
+  // В зеркальном режиме экранные координаты инвертируются.
+  const sx = mirror
+    ? (rect.right - e.clientX) / rect.width * W
+    : (e.clientX - rect.left) / rect.width * W;
+  const gx = Math.max(0, Math.min(W - 1, Math.floor(sx)));
+  const gy = Math.max(0, Math.min(H - 1, Math.floor((e.clientY - rect.top) / rect.height * H)));
+  const hit = findTapTarget(gx, gy);
   press = { gx, gy, hit, t0: Date.now(), longDone: false };
   overlay.setPointerCapture(e.pointerId);
   const tick = () => {
@@ -696,7 +827,7 @@ function endPress() {
     flashRect(hit, '#4f4');
   } else {
     flashTap(gx, gy, '#888');
-    showToast('Тап по фону пропущен. Удерживайте, чтобы отметить пример.');
+    showToast('Здесь нет цвета птицы. Тапайте по жёлтым пятнам, показанным рамками.');
   }
 }
 overlay.addEventListener('pointerup', endPress);
@@ -706,13 +837,21 @@ overlay.addEventListener('pointercancel', () => {
   holdRaf = null;
 });
 
-// Photo training
+// Photo training with zoom / pan / point editing
 const trainModal = document.getElementById('trainModal');
 const trainCanvas = document.getElementById('trainCanvas');
 const trainCtx = trainCanvas.getContext('2d');
 const fileInput = document.getElementById('fileInput');
 const trainHint = document.getElementById('trainHint');
+const trainPanBtn = document.getElementById('trainPan');
 let photoQueue = [], trainImg = null, drawPath = [], isDrawing = false;
+let panMode = false;
+let trainView = { s: 1, ox: 0, oy: 0 };
+let panStart = null;
+let pinch = null;
+let dragPoint = -1;
+let drawPointerId = null;
+const pointers = new Map();
 
 document.getElementById('photo').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
@@ -733,10 +872,11 @@ function nextPhoto() {
     const scale = Math.min(1, 640 / img.width);
     trainCanvas.width = Math.max(1, Math.round(img.width * scale));
     trainCanvas.height = Math.max(1, Math.round(img.height * scale));
+    trainView = { s: 1, ox: 0, oy: 0 };
     drawPath = [];
     isDrawing = false;
     redrawTrainCanvas();
-    trainHint.textContent = `Осталось фото: ${photoQueue.length}. Обведите канарейку и нажмите нужную кнопку.`;
+    trainHint.textContent = `Осталось фото: ${photoQueue.length}. Обведите канарейку: палец по точке — двигать её, тап мимо точек — добавить новую. Пинч — зум, «Сдвинуть» — панорама.`;
     trainModal.classList.add('open');
     URL.revokeObjectURL(url);
   };
@@ -754,53 +894,158 @@ function trainCoords(e) {
     (e.clientY - r.top) * trainCanvas.height / r.height
   ];
 }
+function clampTrainView() {
+  const cw = trainCanvas.width, ch = trainCanvas.height;
+  trainView.s = Math.max(1, Math.min(8, trainView.s));
+  trainView.ox = Math.min(0, Math.max(cw - cw * trainView.s, trainView.ox));
+  trainView.oy = Math.min(0, Math.max(ch - ch * trainView.s, trainView.oy));
+  if (trainView.s === 1) { trainView.ox = 0; trainView.oy = 0; }
+}
+function hitPoint(cx, cy) {
+  const r = Math.max(16, 20 / trainView.s);
+  for (let i = 0; i < drawPath.length; i++) {
+    if (Math.hypot(drawPath[i][0] - cx, drawPath[i][1] - cy) <= r) return i;
+  }
+  return -1;
+}
 function redrawTrainCanvas() {
   if (!trainImg) return;
   const cw = trainCanvas.width, ch = trainCanvas.height;
+  trainCtx.setTransform(1, 0, 0, 1, 0, 0);
+  trainCtx.fillStyle = '#000';
+  trainCtx.fillRect(0, 0, cw, ch);
+  trainCtx.save();
+  trainCtx.translate(trainView.ox, trainView.oy);
+  trainCtx.scale(trainView.s, trainView.s);
   trainCtx.drawImage(trainImg, 0, 0, cw, ch);
-  if (!drawPath.length) return;
-  if (drawPath.length >= 3) {
-    trainCtx.fillStyle = 'rgba(76,175,80,.25)';
+  if (drawPath.length) {
+    const lw = 3 / trainView.s;
+    if (drawPath.length >= 3) {
+      trainCtx.fillStyle = 'rgba(76,175,80,.25)';
+      trainCtx.beginPath();
+      trainCtx.moveTo(...drawPath[0]);
+      for (let i = 1; i < drawPath.length; i++) trainCtx.lineTo(...drawPath[i]);
+      trainCtx.closePath();
+      trainCtx.fill();
+    }
+    trainCtx.strokeStyle = '#4f4';
+    trainCtx.lineWidth = lw;
+    trainCtx.lineJoin = 'round';
+    trainCtx.lineCap = 'round';
     trainCtx.beginPath();
     trainCtx.moveTo(...drawPath[0]);
     for (let i = 1; i < drawPath.length; i++) trainCtx.lineTo(...drawPath[i]);
-    trainCtx.closePath();
-    trainCtx.fill();
+    if (!isDrawing && drawPath.length >= 3) trainCtx.closePath();
+    trainCtx.stroke();
+    trainCtx.fillStyle = '#fff';
+    trainCtx.strokeStyle = '#2c2';
+    trainCtx.lineWidth = lw;
+    const pr = Math.max(3, 5 / trainView.s);
+    for (const p of drawPath) {
+      trainCtx.beginPath();
+      trainCtx.arc(p[0], p[1], pr, 0, Math.PI * 2);
+      trainCtx.fill();
+      trainCtx.stroke();
+    }
   }
-  trainCtx.strokeStyle = '#4f4';
-  trainCtx.lineWidth = 3;
-  trainCtx.lineJoin = 'round';
-  trainCtx.lineCap = 'round';
-  trainCtx.beginPath();
-  trainCtx.moveTo(...drawPath[0]);
-  for (let i = 1; i < drawPath.length; i++) trainCtx.lineTo(...drawPath[i]);
-  if (!isDrawing && drawPath.length >= 3) trainCtx.closePath();
-  trainCtx.stroke();
+  trainCtx.restore();
 }
 trainCanvas.addEventListener('pointerdown', e => {
   if (!trainImg) return;
-  isDrawing = true;
-  drawPath = [trainCoords(e)];
   trainCanvas.setPointerCapture(e.pointerId);
+  const [cx, cy] = trainCoords(e);
+  pointers.set(e.pointerId, { x: cx, y: cy });
+  if (pointers.size === 2) {
+    isDrawing = false;
+    dragPoint = -1;
+    const [p1, p2] = [...pointers.values()];
+    pinch = { d: Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y)), s: trainView.s, ox: trainView.ox, oy: trainView.oy };
+    redrawTrainCanvas();
+    return;
+  }
+  if (panMode) {
+    panStart = { x: cx, y: cy, ox: trainView.ox, oy: trainView.oy };
+    return;
+  }
+  const idx = hitPoint(cx, cy);
+  if (idx >= 0) {
+    dragPoint = idx;
+  } else {
+    drawPath.push([cx, cy]);
+    isDrawing = true;
+    drawPointerId = e.pointerId;
+  }
   redrawTrainCanvas();
 });
 trainCanvas.addEventListener('pointermove', e => {
-  if (!isDrawing) return;
-  const point = trainCoords(e);
-  const last = drawPath[drawPath.length - 1];
-  if (Math.hypot(point[0] - last[0], point[1] - last[1]) > 2.5) {
-    drawPath.push(point);
+  if (!pointers.has(e.pointerId)) return;
+  const [cx, cy] = trainCoords(e);
+  const entry = pointers.get(e.pointerId);
+  entry.x = cx; entry.y = cy;
+  if (pinch && pointers.size === 2) {
+    const [p1, p2] = [...pointers.values()];
+    const d = Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y));
+    const ns = Math.max(1, Math.min(8, pinch.s * d / pinch.d));
+    const midX = (p1.x + p2.x) / 2, midY = (p1.y + p2.y) / 2;
+    trainView.ox = midX - (midX - pinch.ox) * ns / pinch.s;
+    trainView.oy = midY - (midY - pinch.oy) * ns / pinch.s;
+    trainView.s = ns;
+    clampTrainView();
     redrawTrainCanvas();
+    return;
+  }
+  if (dragPoint >= 0) {
+    drawPath[dragPoint] = [cx, cy];
+    redrawTrainCanvas();
+    return;
+  }
+  if (panMode && panStart) {
+    trainView.ox = panStart.ox + (cx - panStart.x);
+    trainView.oy = panStart.oy + (cy - panStart.y);
+    clampTrainView();
+    redrawTrainCanvas();
+    return;
+  }
+  if (isDrawing && e.pointerId === drawPointerId) {
+    const last = drawPath[drawPath.length - 1];
+    if (last && Math.hypot(cx - last[0], cy - last[1]) > 2.5 / trainView.s) {
+      drawPath.push([cx, cy]);
+      redrawTrainCanvas();
+    }
   }
 });
-trainCanvas.addEventListener('pointerup', () => {
-  isDrawing = false;
+function trainEnd(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (e.pointerId === drawPointerId) { isDrawing = false; drawPointerId = null; }
+  dragPoint = -1;
+  panStart = null;
   redrawTrainCanvas();
+}
+trainCanvas.addEventListener('pointerup', trainEnd);
+trainCanvas.addEventListener('pointercancel', trainEnd);
+
+trainPanBtn.addEventListener('click', () => {
+  panMode = !panMode;
+  trainPanBtn.textContent = panMode ? '✏️ Рисовать' : '✋ Сдвинуть';
+  trainPanBtn.classList.toggle('off', panMode);
 });
-trainCanvas.addEventListener('pointercancel', () => {
-  isDrawing = false;
+function zoomTrainBy(factor, cx, cy) {
+  const cw = trainCanvas.width, ch = trainCanvas.height;
+  cx = cx == null ? cw / 2 : cx;
+  cy = cy == null ? ch / 2 : cy;
+  const ns = Math.max(1, Math.min(8, trainView.s * factor));
+  trainView.ox = cx - (cx - trainView.ox) * ns / trainView.s;
+  trainView.oy = cy - (cy - trainView.oy) * ns / trainView.s;
+  trainView.s = ns;
+  clampTrainView();
   redrawTrainCanvas();
+}
+document.getElementById('trainUndo').addEventListener('click', () => {
+  if (drawPath.length) { drawPath.pop(); redrawTrainCanvas(); }
 });
+document.getElementById('trainZoomIn').addEventListener('click', () => zoomTrainBy(1.4));
+document.getElementById('trainZoomOut').addEventListener('click', () => zoomTrainBy(1 / 1.4));
 document.getElementById('trainClear').addEventListener('click', () => {
   drawPath = [];
   isDrawing = false;
@@ -980,9 +1225,9 @@ function medianLum() {
   return .5;
 }
 function shapeScore(blob, lum) {
-  const minSize = lum < .35 ? 25 : 35;
-  if (blob.size < minSize || blob.size > N * .45 || blob.fill < .32 || blob.ratio > 3.2) return 0;
-  const ratioFit = 1 - Math.min(1, Math.log(blob.ratio) / Math.log(3.2));
+  const minSize = lum < .35 ? 20 : 28;
+  if (blob.size < minSize || blob.size > N * .45 || blob.fill < .28 || blob.ratio > 3.5) return 0;
+  const ratioFit = 1 - Math.min(1, Math.log(blob.ratio) / Math.log(3.5));
   const sizeBonus = Math.min(1, Math.sqrt(blob.size / 500));
   return blob.fill * (.55 + .45 * ratioFit) * (.55 + .45 * sizeBonus);
 }
@@ -1026,6 +1271,43 @@ function findBlobs(mask) {
   }
   return blobs;
 }
+// Сливаем близкие пятна: рваная маска канарейки превращается в одно-два пятна.
+function mergeCloseBlobs(blobs) {
+  let list = blobs.slice();
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let i = 0; i < list.length; i++) {
+      if (!list[i]) continue;
+      for (let j = i + 1; j < list.length; j++) {
+        if (!list[j]) continue;
+        const a = list[i], b = list[j];
+        if (a.minX - MERGE_PAD <= b.maxX && b.minX - MERGE_PAD <= a.maxX &&
+            a.minY - MERGE_PAD <= b.maxY && b.minY - MERGE_PAD <= a.maxY) {
+          const size = a.size + b.size;
+          const minX = Math.min(a.minX, b.minX), maxX = Math.max(a.maxX, b.maxX);
+          const minY = Math.min(a.minY, b.minY), maxY = Math.max(a.maxY, b.maxY);
+          const bw = maxX - minX + 1, bh = maxY - minY + 1;
+          list[i] = {
+            size,
+            fill: size / (bw * bh),
+            ratio: Math.max(bw, bh) / Math.max(1, Math.min(bw, bh)),
+            cx: (a.cx * a.size + b.cx * b.size) / size,
+            cy: (a.cy * a.size + b.cy * b.size) / size,
+            minX, maxX, minY, maxY,
+            motionAvg: (a.motionAvg * a.size + b.motionAvg * b.size) / size,
+            gradAvg: (a.gradAvg * a.size + b.gradAvg * b.size) / size,
+            score: 0, ls: null
+          };
+          list[j] = null;
+          merged = true;
+        }
+      }
+    }
+    list = list.filter(Boolean);
+  }
+  return list;
+}
 function dilate(mask) {
   const copy = mask.slice();
   for (let p = 0; p < N; p++) {
@@ -1042,17 +1324,27 @@ function drawOverlay() {
   const sx = vw / W, sy = vh / H;
 
   for (const blob of lastBlobs) {
-    if (blob.size < 8) continue;
     const isBest = blob === bestBlob;
+    if (blob.size < 15 && !isBest) continue;
     octx.lineWidth = isBest ? 4 : 2;
     octx.strokeStyle = isBest ? '#4f4' : '#ff3';
     octx.strokeRect(blob.minX * sx, blob.minY * sy,
       (blob.maxX - blob.minX + 1) * sx, (blob.maxY - blob.minY + 1) * sy);
     if (isBest) {
+      // Подпись рисуется с учётом зеркалирования, чтобы читалась правильно.
+      const lx = blob.minX * sx;
+      const ly = Math.max(22, blob.minY * sy - 6);
       octx.fillStyle = '#4f4';
       octx.font = 'bold 22px system-ui';
-      octx.fillText('🐤 ' + Math.round(blob.score * 100) + '%',
-        blob.minX * sx, Math.max(22, blob.minY * sy - 6));
+      octx.save();
+      if (mirror) {
+        octx.translate(vw - lx, ly);
+        octx.scale(-1, 1);
+        octx.fillText('🐤 ' + Math.round(blob.score * 100) + '%', 0, 0);
+      } else {
+        octx.fillText('🐤 ' + Math.round(blob.score * 100) + '%', lx, ly);
+      }
+      octx.restore();
     }
   }
 
@@ -1129,7 +1421,7 @@ function analyze() {
 
     const lumAverage = lumSum / N / 255;
     const lum = medianLum();
-    const sMin = lum > .7 ? .28 : .32;
+    const sMin = lum > .7 ? .26 : .30;
     const vMin = Math.max(.18, Math.min(.45, lum * .55));
     const useLUT = learn.pos.length > 0 || learn.neg.length > 0;
     const mask = new Uint8Array(N);
@@ -1146,8 +1438,9 @@ function analyze() {
       }
     }
     dilate(mask);
+    dilate(mask);
 
-    const blobs = findBlobs(mask);
+    const blobs = mergeCloseBlobs(findBlobs(mask));
     lastBlobs = blobs;
     lastMask = mask;
 
@@ -1162,11 +1455,13 @@ function analyze() {
         if (hist) {
           learned = learnedScore(hist);
           blob.ls = learned;
-          if (learned < .10 && learn.neg.length >= 2) {
+          // Отбрасываем только при уверенном совпадении с негативами
+          // и при наличии хотя бы одного позитива.
+          if (learned !== null && learned < .10 && learn.pos.length >= 1) {
             blob.score = 0;
             continue;
           }
-          score *= Math.min(1.5, .25 + 1.5 * learned);
+          if (learned !== null) score *= Math.min(1.5, .25 + 1.5 * learned);
         }
       }
       let motionMultiplier = .4 + .6 * Math.min(1, blob.motionAvg * 4);
